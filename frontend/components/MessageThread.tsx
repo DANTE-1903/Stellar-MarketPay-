@@ -24,6 +24,7 @@ import {
 import type { Message } from "@/utils/types";
 import { shortenAddress, timeAgo } from "@/utils/format";
 import clsx from "clsx";
+import { useVirtualizer } from "@tanstack/react-virtual";
 
 interface MessageThreadProps {
   jobId: string;
@@ -120,12 +121,23 @@ export default function MessageThread({ jobId, currentUserAddress, otherUserAddr
   const [encrypting, setEncrypting] = useState(false);
   const [loading, setLoading]     = useState(true);
   const [error, setError]         = useState<string | null>(null);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
 
   const messagesEndRef       = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef             = useRef<HTMLInputElement>(null);
   const fileInputRef         = useRef<HTMLInputElement>(null);
   const isMountedRef         = useRef<boolean>(true);
+  const shouldScrollToBottomRef = useRef<boolean>(true);
+
+  const rowVirtualizer = useVirtualizer({
+    count: messages.length,
+    getScrollElement: () => messagesContainerRef.current,
+    estimateSize: () => 100,
+    overscan: 5,
+  });
 
   // Fetch messages on mount
   useEffect(() => {
@@ -134,8 +146,15 @@ export default function MessageThread({ jobId, currentUserAddress, otherUserAddr
       try {
         setLoading(true);
         setError(null);
-        const msgs = await fetchMessages(jobId);
-        if (isMountedRef.current) setMessages(msgs);
+        const res = await fetchMessages(jobId, { limit: 50 });
+        const msgs = Array.isArray(res) ? res : res.messages;
+        const cursor = Array.isArray(res) ? null : res.nextCursor;
+        if (isMountedRef.current) {
+          setMessages(msgs || []);
+          setNextCursor(cursor || null);
+          setHasMore(Boolean(cursor));
+          shouldScrollToBottomRef.current = true;
+        }
       } catch (e: unknown) {
         if (isMountedRef.current) {
           setError(e instanceof Error ? e.message : "Failed to load messages");
@@ -158,12 +177,66 @@ export default function MessageThread({ jobId, currentUserAddress, otherUserAddr
   }, [currentUserAddress]);
 
   const scrollToBottom = useCallback(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, []);
+    if (messages.length > 0) {
+      rowVirtualizer.scrollToIndex(messages.length - 1, { align: "end", behavior: "auto" });
+    }
+  }, [messages.length, rowVirtualizer]);
 
   useEffect(() => {
-    scrollToBottom();
-  }, [messages, scrollToBottom]);
+    if (messages.length > 0 && messagesContainerRef.current) {
+      const scrollElement = messagesContainerRef.current;
+      const isScrolledNearBottom = scrollElement.scrollHeight - scrollElement.scrollTop - scrollElement.clientHeight < 150;
+      if (isScrolledNearBottom || loading) {
+         scrollToBottom();
+      }
+    }
+  }, [messages.length, loading, scrollToBottom]);
+
+  // Load older messages for infinite scroll
+  const loadOlderMessages = useCallback(async () => {
+    if (!nextCursor || loadingOlder || loading) return;
+    const container = messagesContainerRef.current;
+    if (!container) return;
+
+    const prevScrollHeight = container.scrollHeight;
+    const prevScrollTop = container.scrollTop;
+
+    setLoadingOlder(true);
+    try {
+      const res = await fetchMessages(jobId, { limit: 50, before: nextCursor });
+      const olderMsgs = Array.isArray(res) ? res : res.messages;
+      const olderCursor = Array.isArray(res) ? null : res.nextCursor;
+
+      if (isMountedRef.current) {
+        setMessages((prev) => [...olderMsgs, ...prev]);
+        setNextCursor(olderCursor || null);
+        setHasMore(Boolean(olderCursor));
+
+        // Preserve scroll position
+        requestAnimationFrame(() => {
+          if (container) {
+            const heightDiff = container.scrollHeight - prevScrollHeight;
+            container.scrollTop = prevScrollTop + heightDiff;
+          }
+        });
+      }
+    } catch (e: unknown) {
+      console.error("[MessageThread] Failed to load older messages:", e);
+    } finally {
+      if (isMountedRef.current) {
+        setLoadingOlder(false);
+      }
+    }
+  }, [jobId, nextCursor, loadingOlder, loading]);
+
+  const handleScroll = useCallback(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+
+    if (container.scrollTop <= 40 && hasMore && !loadingOlder && !loading) {
+      loadOlderMessages();
+    }
+  }, [hasMore, loadingOlder, loading, loadOlderMessages]);
 
   const handleSend = async (e: FormEvent) => {
     e.preventDefault();
@@ -181,6 +254,7 @@ export default function MessageThread({ jobId, currentUserAddress, otherUserAddr
       createdAt: new Date().toISOString(),
     };
 
+    shouldScrollToBottomRef.current = true;
     setMessages((prev) => [...prev, optimisticMessage]);
     setInput("");
     setSending(true);
@@ -235,7 +309,7 @@ export default function MessageThread({ jobId, currentUserAddress, otherUserAddr
       }
       const data = new Uint8Array(await file.arrayBuffer());
       const encrypted = encryptForRecipient(data, recipientKey);
-      const blob = new Blob([encrypted], { type: "application/octet-stream" });
+      const blob = new Blob([encrypted.buffer as ArrayBuffer], { type: "application/octet-stream" });
       const senderPub = myPublicKeyBase64();
       const msg = await uploadMessageAttachment(jobId, blob, file.name + ".enc", senderPub);
       if (isMountedRef.current) setMessages((prev) => [...prev, msg]);
@@ -299,47 +373,121 @@ export default function MessageThread({ jobId, currentUserAddress, otherUserAddr
       {/* Messages list */}
       <div
         ref={messagesContainerRef}
-        className="flex-1 overflow-y-auto px-4 py-4 space-y-3 min-h-[300px] max-h-[400px]"
+        className="flex-1 overflow-y-auto px-4 py-4 min-h-[300px] max-h-[400px]"
       >
+        {/* Loading older messages indicator or manual load button */}
+        {loadingOlder && (
+          <div className="flex items-center justify-center gap-2 py-2 text-xs text-market-400">
+            <svg className="w-3.5 h-3.5 animate-spin text-market-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="12" cy="12" r="10" strokeOpacity="0.3" />
+              <path d="M12 2a10 10 0 0110 10" strokeLinecap="round" />
+            </svg>
+            <span>Loading older messages…</span>
+          </div>
+        )}
+        {!loadingOlder && hasMore && (
+          <div className="flex justify-center py-1">
+            <button
+              type="button"
+              onClick={loadOlderMessages}
+              className="text-[11px] text-amber-600 hover:text-amber-400 underline py-1 px-3 rounded-md hover:bg-market-500/10 transition-colors"
+            >
+              Load earlier messages
+            </button>
+          </div>
+        )}
+
         {messages.length === 0 ? (
           <div className="text-center py-12">
             <p className="text-amber-800 text-sm">No messages yet. Start the conversation!</p>
           </div>
-        ) : (
-          messages.map((msg) => {
-            const own = isOwnMessage(msg.senderAddress);
-            return (
-              <div
-                key={msg.id}
-                className={clsx(
-                  "flex flex-col max-w-[80%] rounded-2xl px-4 py-3",
-                  own
-                    ? "ml-auto bg-market-500/10 border border-market-500/15"
-                    : "bg-ink-800",
-                )}
-              >
-                <div className="flex items-center gap-2 mb-1">
-                  <span className="text-xs font-semibold text-market-400">
-                    {own ? "You" : shortenAddress(msg.senderAddress)}
-                  </span>
-                  <span className="text-[10px] text-amber-900">{timeAgo(msg.createdAt)}</span>
+        ) : rowVirtualizer.getVirtualItems().length > 0 ? (
+          <div
+            style={{
+              height: `${rowVirtualizer.getTotalSize()}px`,
+              width: "100%",
+              position: "relative",
+            }}
+          >
+            {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+              const msg = messages[virtualRow.index];
+              const own = isOwnMessage(msg.senderAddress);
+              return (
+                <div
+                  key={virtualRow.key}
+                  data-index={virtualRow.index}
+                  ref={rowVirtualizer.measureElement}
+                  className="absolute top-0 left-0 w-full py-1.5"
+                  style={{
+                    transform: `translateY(${virtualRow.start}px)`,
+                  }}
+                >
+                  <div
+                    className={clsx(
+                      "flex flex-col max-w-[80%] rounded-2xl px-4 py-3",
+                      own
+                        ? "ml-auto bg-market-500/10 border border-market-500/15"
+                        : "bg-ink-800",
+                    )}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="text-xs font-semibold text-market-400">
+                        {own ? "You" : shortenAddress(msg.senderAddress)}
+                      </span>
+                      <span className="text-[10px] text-amber-900">{timeAgo(msg.createdAt)}</span>
+                    </div>
+                    <p className="text-amber-100 text-sm leading-relaxed break-words">
+                      {msg.content}
+                    </p>
+                    {msg.attachmentCid && (
+                      <AttachmentLine
+                        cid={msg.attachmentCid}
+                        name={msg.attachmentName}
+                        mime={msg.attachmentMime}
+                        senderNaclPub={msg.senderNaclPub}
+                      />
+                    )}
+                  </div>
                 </div>
-                <p className="text-amber-100 text-sm leading-relaxed break-words">
-                  {msg.content}
-                </p>
-                {msg.attachmentCid && (
-                  <AttachmentLine
-                    cid={msg.attachmentCid}
-                    name={msg.attachmentName}
-                    mime={msg.attachmentMime}
-                    senderNaclPub={msg.senderNaclPub}
-                  />
-                )}
-              </div>
-            );
-          })
+              );
+            })}
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {messages.map((msg, index) => {
+              const own = isOwnMessage(msg.senderAddress);
+              return (
+                <div
+                  key={msg.id || index}
+                  className={clsx(
+                    "flex flex-col max-w-[80%] rounded-2xl px-4 py-3",
+                    own
+                      ? "ml-auto bg-market-500/10 border border-market-500/15"
+                      : "bg-ink-800",
+                  )}
+                >
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="text-xs font-semibold text-market-400">
+                      {own ? "You" : shortenAddress(msg.senderAddress)}
+                    </span>
+                    <span className="text-[10px] text-amber-900">{timeAgo(msg.createdAt)}</span>
+                  </div>
+                  <p className="text-amber-100 text-sm leading-relaxed break-words">
+                    {msg.content}
+                  </p>
+                  {msg.attachmentCid && (
+                    <AttachmentLine
+                      cid={msg.attachmentCid}
+                      name={msg.attachmentName}
+                      mime={msg.attachmentMime}
+                      senderNaclPub={msg.senderNaclPub}
+                    />
+                  )}
+                </div>
+              );
+            })}
+          </div>
         )}
-        <div ref={messagesEndRef} />
       </div>
 
       {/* Error banner (non-blocking) */}

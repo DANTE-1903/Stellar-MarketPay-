@@ -4,18 +4,23 @@
 #
 # Usage:
 #   chmod +x scripts/deploy-contract.sh
-#   ./scripts/deploy-contract.sh [testnet|mainnet] [identity]
+#   ./scripts/deploy-contract.sh [testnet|mainnet] [identity] [version]
+#
+# `version` is the semver string stored on-chain and returned by
+# `get_version()`; it defaults to the contract's Cargo.toml version.
 
 set -euo pipefail
 
 NETWORK=${1:-testnet}
 IDENTITY=${2:-alice}
 CONTRACT_DIR="$(dirname "$0")/../contracts/marketpay-contract"
-WASM="$CONTRACT_DIR/target/wasm32-unknown-unknown/release/marketpay_contract.wasm"
+WASM="$CONTRACT_DIR/target/wasm32v1-none/release/marketpay_contract.wasm"
+VERSION=${3:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$CONTRACT_DIR/Cargo.toml" | head -1)}
 
 echo "🏪 Stellar MarketPay — Contract Deploy"
 echo "   Network:  $NETWORK"
 echo "   Identity: $IDENTITY"
+echo "   Version:  $VERSION"
 echo ""
 
 command -v stellar &>/dev/null || { echo "❌ stellar CLI not found. Run: cargo install --locked stellar-cli"; exit 1; }
@@ -24,7 +29,7 @@ command -v cargo   &>/dev/null || { echo "❌ Rust/Cargo not found. Run: https:/
 # Build
 echo "🔨 Building WASM..."
 cd "$CONTRACT_DIR"
-cargo build --target wasm32-unknown-unknown --release
+cargo build --target wasm32v1-none --release
 echo "   ✅ Built: $(du -sh "$WASM" | cut -f1)"
 
 # Deploy
@@ -48,8 +53,11 @@ if [[ -n "$ADMIN_KEY" ]]; then
     --id "$CONTRACT_ID" \
     --source "$IDENTITY" \
     --network "$NETWORK" \
-    -- initialize \
-    --admin "$ADMIN_KEY"
+    -- \
+    initialize \
+    --admin "$ADMIN_KEY" \
+    --treasury_address "$ADMIN_KEY" \
+    --version "$VERSION"
   echo "   ✅ Initialized"
 fi
 

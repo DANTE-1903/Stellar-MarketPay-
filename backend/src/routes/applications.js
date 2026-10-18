@@ -6,15 +6,17 @@ const express = require("express");
 const router  = express.Router();
 const { createRateLimiter } = require("../middleware/rateLimiter");
 
-const applicationRateLimiter = createRateLimiter(5, 1); // 100 requests per 15 minutes
-const generalApplicationRateLimiter = createRateLimiter(30, 1); // 100 requests per minute for listing/getting applications
+const applicationRateLimiter = createRateLimiter(5, 1, { name: "applications-write" }); // 5 POST requests per minute
+const generalApplicationRateLimiter = createRateLimiter(100, 1, { name: "applications-read" }); // 100 read requests per minute
 
 const {
   submitApplication, getApplicationsForJob,
   getApplicationsForFreelancer, acceptApplication,
   withdrawApplication,
+  getApplicationStatusHistory,
   closeBiddingForJob,
   revealApplicationBid,
+  bulkUpdateApplications,
 } = require("../services/applicationService");
 const { FREELANCER_TIERS } = require("../services/profileService");
 const { logContractInteraction } = require("../services/contractAuditService");
@@ -22,6 +24,15 @@ const { notifyEscrowEvent, EVENT_TYPES } = require("../services/notificationServ
 const { getJob } = require("../services/jobService");
 const { validateJsonb } = require("../middleware/jsonbValidator");
 const screeningAnswersSchema = require("../schemas/screeningAnswers.schema");
+const {
+  validate,
+  createApplicationSchema,
+  closeBiddingSchema,
+  revealBidSchema,
+  acceptApplicationSchema,
+  withdrawApplicationSchema,
+  bulkUpdateApplicationsSchema,
+} = require("../validators/applicationValidator");
 
 /**
  * @swagger
@@ -70,8 +81,20 @@ router.get("/job/:jobId", generalApplicationRateLimiter, async (req, res, next) 
       throw e;
     }
 
-    const applications = await getApplicationsForJob(req.params.jobId, { tier });
-    res.json({ success: true, data: applications });
+    const limit = req.query.limit === undefined ? 20 : Number(req.query.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      const e = new Error("Invalid application limit");
+      e.status = 400;
+      throw e;
+    }
+    const cursor = typeof req.query.cursor === "string" && req.query.cursor ? req.query.cursor : null;
+    const options = { tier };
+    if (req.query.limit !== undefined) options.limit = limit;
+    if (cursor) options.cursor = cursor;
+    const result = await getApplicationsForJob(req.params.jobId, options);
+    const applications = Array.isArray(result) ? result : result.applications;
+    const nextCursor = Array.isArray(result) ? null : result.nextCursor;
+    res.json({ success: true, data: applications, applications, nextCursor });
   } catch (e) {
     next(e);
   }
@@ -151,14 +174,23 @@ router.get("/freelancer/:publicKey", generalApplicationRateLimiter, async (req, 
 // POST /api/applications — submit a proposal
 router.post("/", applicationRateLimiter, validateJsonb({ screeningAnswers: screeningAnswersSchema }), async (req, res, next) => {
   try {
-    const app = await submitApplication(req.body);
+    const body = validate(createApplicationSchema, req.body);
+    const job = await getJob(body.jobId);
+    if (job && req.user) {
+      const clientId = job.client_id ?? job.clientAddress ?? job.clientId;
+      const userId = req.user.id ?? req.user.publicKey;
+      if (
+        (job.client_id && req.user.id && job.client_id === req.user.id) ||
+        (clientId && userId && clientId === userId)
+      ) {
+        return res.status(400).json({ error: "You cannot apply to your own job" });
+      }
+    }
+    const app = await submitApplication(body);
     
     // Emit WebSocket event for real-time bid updates
     const broadcastRealtime = req.app.locals.broadcastRealtime;
     if (broadcastRealtime) {
-      // Get job details for the broadcast
-      const job = await getJob(app.jobId);
-      
       broadcastRealtime(`job:${app.jobId}:bids`, {
         type: 'new_bid',
         application: {
@@ -170,7 +202,7 @@ router.post("/", applicationRateLimiter, validateJsonb({ screeningAnswers: scree
           createdAt: app.createdAt,
           status: app.status
         },
-        jobTitle: job.title
+        jobTitle: job?.title
       });
     }
     
@@ -181,7 +213,8 @@ router.post("/", applicationRateLimiter, validateJsonb({ screeningAnswers: scree
 // POST /api/applications/job/:jobId/close-bidding — client closes bidding round
 router.post("/job/:jobId/close-bidding", applicationRateLimiter, async (req, res, next) => {
   try {
-    const result = await closeBiddingForJob(req.params.jobId, req.body.clientAddress);
+    const { clientAddress } = validate(closeBiddingSchema, req.body);
+    const result = await closeBiddingForJob(req.params.jobId, clientAddress);
     res.json({ success: true, data: result });
   } catch (e) {
     next(e);
@@ -191,11 +224,12 @@ router.post("/job/:jobId/close-bidding", applicationRateLimiter, async (req, res
 // POST /api/applications/:id/reveal — freelancer reveals sealed bid
 router.post("/:id/reveal", applicationRateLimiter, async (req, res, next) => {
   try {
+    const { freelancerAddress, bidAmount, nonce } = validate(revealBidSchema, req.body);
     const app = await revealApplicationBid(
       req.params.id,
-      req.body.freelancerAddress,
-      req.body.bidAmount,
-      req.body.nonce,
+      freelancerAddress,
+      bidAmount,
+      nonce,
     );
     res.json({ success: true, data: app });
   } catch (e) {
@@ -206,12 +240,13 @@ router.post("/:id/reveal", applicationRateLimiter, async (req, res, next) => {
 // POST /api/applications/:id/accept — client accepts a proposal
 router.post("/:id/accept", applicationRateLimiter, async (req, res, next) => {
   try {
-    const app = await acceptApplication(req.params.id, req.body.clientAddress);
-    await logContractInteraction({
+    const { clientAddress, contractTxHash } = validate(acceptApplicationSchema, req.body);
+    const app = await acceptApplication(req.params.id, clientAddress);
+    logContractInteraction({
       functionName: "start_work",
-      callerAddress: req.body.clientAddress,
+      callerAddress: clientAddress,
       jobId: app.jobId,
-      txHash: req.body.contractTxHash || `offchain-${Date.now()}`,
+      txHash: contractTxHash || `offchain-${Date.now()}`,
     });
 
     // Notify freelancer about accepted application
@@ -239,10 +274,19 @@ router.post("/:id/accept", applicationRateLimiter, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// GET /api/applications/:id/history — audit trail of status transitions
+router.get("/:id/history", generalApplicationRateLimiter, async (req, res, next) => {
+  try {
+    const history = await getApplicationStatusHistory(req.params.id);
+    res.json({ success: true, data: history });
+  } catch (e) { next(e); }
+});
+
 // DELETE /api/applications/:id — freelancer withdraws their application
 router.delete("/:id", applicationRateLimiter, async (req, res, next) => {
   try {
-    const app = await withdrawApplication(req.params.id, req.body.freelancerAddress);
+    const { freelancerAddress } = validate(withdrawApplicationSchema, req.body);
+    const app = await withdrawApplication(req.params.id, freelancerAddress);
 
     // Broadcast withdrawal so all connected clients remove the card
     req.app.locals.broadcastRealtime?.(`job:${app.jobId}:bids`, {
@@ -252,6 +296,33 @@ router.delete("/:id", applicationRateLimiter, async (req, res, next) => {
 
     res.json({ success: true, data: app });
   } catch (e) { next(e); }
+});
+
+// POST /api/applications/bulk-update — client bulk rejects or shortlists applications
+router.post("/bulk-update", applicationRateLimiter, async (req, res, next) => {
+  try {
+    const { applicationIds, action, status, clientAddress } = validate(
+      bulkUpdateApplicationsSchema,
+      req.body,
+    );
+    const result = await bulkUpdateApplications({
+      applicationIds,
+      action: action || status,
+      clientAddress,
+    });
+
+    if (result.jobId) {
+      req.app.locals.broadcastRealtime?.(`job:${result.jobId}:bids`, {
+        type: "applications:bulk_update",
+        applicationIds,
+        status: result.status,
+      });
+    }
+
+    res.json({ success: true, data: result });
+  } catch (e) {
+    next(e);
+  }
 });
 
 module.exports = router;

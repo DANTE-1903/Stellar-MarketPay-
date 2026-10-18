@@ -278,9 +278,10 @@ CREATE INDEX IF NOT EXISTS referral_payouts_referee_idx  ON referral_payouts(ref
 -- ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS scope_sessions (
   session_id        TEXT PRIMARY KEY,
-  content           TEXT          NOT NULL DEFAULT '',
+  content           TEXT          NOT NULL DEFAULT '' CHECK (octet_length(content) <= 524288),
   cursors           JSONB         NOT NULL DEFAULT '{}'::jsonb,
   finalized         BOOLEAN       NOT NULL DEFAULT false,
+  finalized_hash    TEXT,
   finalized_payload JSONB,
   expires_at        TIMESTAMPTZ   NOT NULL,
   created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),

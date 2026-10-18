@@ -1,12 +1,12 @@
+
 /**
  * src/routes/jobs.js
  */
 "use strict";
-
+ 
 const express = require("express");
 const router = express.Router();
-
-const { createRateLimiter, createDisputeRateLimiter } = require("../middleware/rateLimiter");
+const { createRateLimiter } = require("../middleware/rateLimiter");
 const { verifyJWT } = require("../middleware/auth");
 const jobService = require("../services/jobService");
 const {
@@ -25,24 +25,36 @@ const {
   extendJobExpiry,
   getSuggestions,
 } = jobService.default || jobService;
-
+ 
 const { logContractInteraction } = require("../services/contractAuditService");
 const { getClientReputation } = require("../services/profileService");
-const cache = require("../services/cacheService");
+const { scheduleReputationRecalcForJob } = require("../services/reputationService");
+const cache = require("../utils/cache");
 const jobDraftService = require("../services/jobDraftService");
 const recommendationService = require("../services/recommendationService");
+const invoiceService = require("../services/invoiceService");
 const { validateJsonb } = require("../middleware/jsonbValidator");
+const {
+  validate,
+  createJobSchema,
+  extendJobSchema,
+  inviteJobSchema,
+  reportJobSchema,
+  updateEscrowSchema,
+} = require("../validators/jobValidator");
 const milestonesSchema = require("../schemas/milestones.schema");
-
+const { Horizon } = require("@stellar/stellar-sdk");
+const horizonClient = require("../utils/horizonClient");
 const jobCreationRateLimiter = createRateLimiter(10, 1); // 10 job creations per minute
 const generalJobRateLimiter = createRateLimiter(100, 1); // 100 requests per minute
 const reportJobRateLimiter = createRateLimiter(20, 1);
 const suggestRateLimiter = createRateLimiter(20, 1);
-
+const createDisputeRateLimiter = createRateLimiter(10, 1);
+ 
 const jobReports = new Map();
-
+ 
 // Feed Helpers
-
+ 
 function escapeXml(str) {
   if (str === null || str === undefined) return "";
   return String(str)
@@ -52,21 +64,21 @@ function escapeXml(str) {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
 }
-
+ 
 function formatDateRss(date) {
   return date.toUTCString();
 }
-
+ 
 function formatDateAtom(date) {
   return date.toISOString();
 }
-
+ 
 function truncateDescription(description, maxLength = 200) {
   if (!description) return "";
   if (description.length <= maxLength) return description;
   return description.substring(0, maxLength - 3) + "...";
 }
-
+ 
 // Apply feed-only query filters (skills, budget range) to an already-fetched job list.
 function filterFeedJobs(jobs, { skills, min_budget, max_budget } = {}) {
   let filtered = jobs;
@@ -85,7 +97,7 @@ function filterFeedJobs(jobs, { skills, min_budget, max_budget } = {}) {
   if (!isNaN(max)) filtered = filtered.filter((job) => parseFloat(job.budget) <= max);
   return filtered;
 }
-
+ 
 // Build a feed title suffix that reflects the active filters.
 function feedTitleSuffix({ category, skills } = {}) {
   const parts = [];
@@ -94,11 +106,11 @@ function feedTitleSuffix({ category, skills } = {}) {
   if (skillList.length > 0) parts.push(`matching ${skillList.join(", ")}`);
   return parts.length ? ` — ${parts.join(" ")}` : "";
 }
-
+ 
 function normalizeAddress(address) {
   return typeof address === "string" ? address.trim() : "";
 }
-
+ 
 function isAdmin(req) {
   if (!req.user) return false;
   const adminAddresses = (process.env.ADMIN_WALLET_ADDRESSES || "")
@@ -107,13 +119,8 @@ function isAdmin(req) {
     .filter(Boolean);
   return adminAddresses.includes(req.user.publicKey) || req.user.role === "admin";
 }
-
-function isValidReportCategory(category) {
-  return ["fraud", "suspicious", "spam", "inappropriate", "other"].includes(
-    category,
-  );
-}
-
+ 
+ 
 async function enrichJobsWithClientReputation(jobs) {
   const scoreCache = new Map();
   return Promise.all(
@@ -131,7 +138,7 @@ async function enrichJobsWithClientReputation(jobs) {
     }),
   );
 }
-
+ 
 /**
  * @swagger
  * /api/jobs:
@@ -163,6 +170,11 @@ async function enrichJobsWithClientReputation(jobs) {
  *         schema:
  *           type: string
  *         description: Search term for job titles and descriptions
+ *       - in: query
+ *         name: q
+ *         schema:
+ *           type: string
+ *         description: Full-text search query for job titles and descriptions
  *       - in: query
  *         name: cursor
  *         schema:
@@ -206,6 +218,7 @@ router.get("/", generalJobRateLimiter, async (req, res, next) => {
       status,
       limit,
       search,
+      q,
       cursor,
       after,
       timezone,
@@ -224,18 +237,19 @@ router.get("/", generalJobRateLimiter, async (req, res, next) => {
     const includeExpired = include_expired === "true";
     const includeDeleted = req.query.include_deleted === "true" && isAdmin(req);
     const effectiveCursor = after || cursor;
-
+ 
     if (page !== undefined && !effectiveCursor) {
       res.set("Deprecation", "true");
       res.set("Link", '</api/jobs>; rel="deprecation"');
       res.set("Sunset", "2025-12-31");
     }
-
+ 
     const cacheKey = cache.jobListKey({
       category,
       status,
       limit: String(safeLimit),
       search,
+      q,
       cursor: effectiveCursor,
       timezone,
       viewerAddress,
@@ -251,28 +265,37 @@ router.get("/", generalJobRateLimiter, async (req, res, next) => {
     const cached = await cache.get(cacheKey);
     if (cached) {
       res.set("X-Cache", "HIT");
-      return res.json({ success: true, ...cached, has_more: Boolean(cached.nextCursor), ...(page !== undefined && !effectiveCursor && { _deprecation: "The `page` parameter is deprecated. Use cursor-based pagination via `after`." }) });
+      return res.json({ success: true, ...cached, total: cached.total ?? null, has_more: Boolean(cached.nextCursor), ...(page !== undefined && !effectiveCursor && { _deprecation: "The `page` parameter is deprecated. Use cursor-based pagination via `after`." }) });
     }
-
+ 
     const result = await listJobs({
       category,
       status,
       limit: safeLimit,
       search,
+      q,
       cursor: effectiveCursor,
       timezone,
       viewerAddress,
       includeExpired,
       includeDeleted,
+      min_budget,
+      max_budget,
+      skills,
+      min_client_rating,
+      duration,
+      posted_since,
+      max_applications,
     });
-
+ 
     const jobsWithRep = await enrichJobsWithClientReputation(result.jobs);
-    await cache.set(cacheKey, { data: jobsWithRep, nextCursor: result.nextCursor }, cache.TTL.JOBS_LIST);
+    await cache.set(cacheKey, { data: jobsWithRep, nextCursor: result.nextCursor, total: result.total }, cache.TTL.JOBS_LIST);
     res.set("X-Cache", "MISS");
     res.json({
       success: true,
       data: jobsWithRep,
-      next_cursor: result.nextCursor,
+      nextCursor: result.nextCursor,
+      total: result.total,
       has_more: Boolean(result.nextCursor),
       ...(page !== undefined && !effectiveCursor && {
         _deprecation: "The `page` parameter is deprecated. Use cursor-based pagination via `after`.",
@@ -282,7 +305,7 @@ router.get("/", generalJobRateLimiter, async (req, res, next) => {
     next(e);
   }
 });
-
+ 
 // GET /api/jobs/client/:publicKey — list jobs posted by a client
 router.get(
   "/client/:publicKey",
@@ -299,7 +322,7 @@ router.get(
     }
   },
 );
-
+ 
 // GET /api/jobs/recommended/:publicKey — top 5 skill-matched open jobs for a freelancer
 router.get(
   "/recommended/:publicKey",
@@ -313,7 +336,18 @@ router.get(
     }
   },
 );
-
+ 
+// GET /api/jobs/:id/timeline — get job timeline events (Issue #876)
+router.get("/:id/timeline", generalJobRateLimiter, async (req, res, next) => {
+  try {
+    const { getJobTimeline } = require("../services/jobService");
+    const timeline = await getJobTimeline(req.params.id);
+    res.json({ success: true, data: timeline });
+  } catch (e) {
+    next(e);
+  }
+});
+ 
 // GET /api/jobs/:id — get single job
 router.get("/:id", generalJobRateLimiter, async (req, res, next) => {
   try {
@@ -323,7 +357,31 @@ router.get("/:id", generalJobRateLimiter, async (req, res, next) => {
     next(e);
   }
 });
-
+ 
+// GET /api/jobs/:id/invoice — generate a PDF invoice for a completed job
+router.get("/:id/invoice", verifyJWT, generalJobRateLimiter, async (req, res, next) => {
+  try {
+    const job = await getJob(req.params.id, { includeDeleted: false });
+    
+    // Authorization: only client or freelancer can download the invoice
+    if (job.clientAddress !== req.user.publicKey && job.freelancerAddress !== req.user.publicKey && !isAdmin(req)) {
+      return res.status(403).json({ success: false, error: "Only the client or freelancer can download the invoice" });
+    }
+ 
+    // Must be completed (optional depending on strictness, but typical for invoices)
+    if (job.status !== "completed") {
+      return res.status(400).json({ success: false, error: "Invoice is only available for completed jobs" });
+    }
+ 
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename=invoice-${job.id}.pdf`);
+ 
+    await invoiceService.generateInvoicePdf(job, res);
+  } catch (e) {
+    next(e);
+  }
+});
+ 
 /**
  * @swagger
  * /api/jobs:
@@ -400,24 +458,73 @@ router.get("/:id", generalJobRateLimiter, async (req, res, next) => {
 // POST /api/jobs — create a new job
 router.post("/", jobCreationRateLimiter, verifyJWT, validateJsonb({ milestones: milestonesSchema }), async (req, res, next) => {
   try {
+    // 1) Check authentication/signed address first
     const signedAddress = req.user?.publicKey;
-    const payloadClientAddress = typeof req.body.clientAddress === "string" ? req.body.clientAddress.trim() : "";
-
-    if (!signedAddress || !payloadClientAddress) {
-      return res.status(401).json({ error: "Unauthorized: clientAddress is required and must match the signed wallet address" });
+    const payloadClientAddressRaw = typeof req.body.clientAddress === "string" ? req.body.clientAddress.trim() : "";
+    if (!signedAddress || !payloadClientAddressRaw) {
+      return res
+        .status(401)
+        .json({ error: "Unauthorized: clientAddress is required and must match the signed wallet address" });
     }
-
-    if (payloadClientAddress !== signedAddress) {
-      return res.status(401).json({ error: "Unauthorized: clientAddress does not match signed wallet address" });
+    if (payloadClientAddressRaw !== signedAddress) {
+      return res
+        .status(401)
+        .json({ error: "Unauthorized: clientAddress does not match signed wallet address" });
     }
-
-    const job = await createJob({ ...req.body, clientAddress: signedAddress });
+ 
+    // 2) Parse budget safely
+    const rawBudget = req.body.budget;
+    let budgetForValidation;
+    if (rawBudget === "" || rawBudget === null || rawBudget === undefined) {
+      budgetForValidation = undefined;
+    } else {
+      const parsed = Number(String(rawBudget).trim());
+      if (!Number.isFinite(parsed)) {
+        return res.status(400).json({ error: "Budget must be a valid number" });
+      }
+      budgetForValidation = parsed;
+    }
+ 
+    // 3) Validate input after auth and safe coercion
+    const bodyToValidate = {
+      ...req.body,
+      ...(budgetForValidation !== undefined ? { budget: budgetForValidation } : {}),
+    };
+    const validatedBody = validate(createJobSchema, bodyToValidate);
+ 
+    // 4) Create job with the verified signedAddress
+    const job = await createJob({ ...validatedBody, clientAddress: signedAddress });
+    if (typeof cache.invalidateJobListCache === "function") {
+      await cache.invalidateJobListCache();
+    }
+    if (typeof cache.delPattern === "function") {
+      await cache.delPattern("jobs:list:*");
+    }
     res.status(201).json({ success: true, data: job });
   } catch (e) {
     next(e);
   }
 });
-
+ 
+// PATCH /api/jobs/:id — update job status or details
+router.patch("/:id", verifyJWT, generalJobRateLimiter, async (req, res, next) => {
+  try {
+    const { status } = req.body;
+    let job;
+    if (status) {
+      const { updateJobStatus } = jobService.default || jobService;
+      job = await updateJobStatus(req.params.id, status);
+    } else {
+      const { getJob } = jobService.default || jobService;
+      job = await getJob(req.params.id);
+    }
+    await cache.invalidateJobListCache();
+    res.json({ success: true, data: job });
+  } catch (e) {
+    next(e);
+  }
+});
+ 
 // POST /api/jobs/:id/view — increment view count
 router.post("/:id/view", generalJobRateLimiter, async (req, res, next) => {
   try {
@@ -427,27 +534,28 @@ router.post("/:id/view", generalJobRateLimiter, async (req, res, next) => {
     next(e);
   }
 });
-
+ 
 // POST /api/jobs/:id/invite — invite freelancer to invite-only job
 router.post("/:id/invite", verifyJWT, generalJobRateLimiter, async (req, res, next) => {
   try {
+    const { freelancerAddress } = validate(inviteJobSchema, req.body);
     const { inviteFreelancerToJob } = require("../services/jobInvitationService");
     const invitation = await inviteFreelancerToJob({
       jobId: req.params.id,
       clientAddress: req.user.publicKey,
-      freelancerAddress: req.body.freelancerAddress,
+      freelancerAddress,
     });
-
+ 
     req.app.locals.broadcastRealtime?.("job:invited", {
       jobId: req.params.id,
       recipientAddress: invitation.freelancer_address,
       invitedAt: invitation.created_at,
     });
-
+ 
     res.status(201).json({ success: true, data: invitation });
   } catch (e) { next(e); }
 });
-
+ 
 // GET /api/jobs/:id/invitations — list all invitations for a job
 router.get("/:id/invitations", verifyJWT, generalJobRateLimiter, async (req, res, next) => {
   try {
@@ -467,7 +575,7 @@ router.get("/:id/invitations", verifyJWT, generalJobRateLimiter, async (req, res
       e.status = 403;
       throw e;
     }
-
+ 
     const { rows } = await pool.query(
       `SELECT ji.id, ji.job_id, ji.freelancer_address, ji.status, ji.created_at,
               p.display_name AS freelancer_name
@@ -477,11 +585,11 @@ router.get("/:id/invitations", verifyJWT, generalJobRateLimiter, async (req, res
        ORDER BY ji.created_at DESC`,
       [req.params.id]
     );
-
+ 
     res.json({ success: true, data: rows });
   } catch (e) { next(e); }
 });
-
+ 
 // PATCH /api/jobs/:id/escrow — store escrow contract ID after on-chain lock
 router.patch(
   "/:id/escrow",
@@ -489,39 +597,81 @@ router.patch(
   generalJobRateLimiter,
   async (req, res, next) => {
     try {
-      const { escrowContractId } = req.body;
-      const job = await updateJobEscrowId(req.params.id, escrowContractId);
-      await logContractInteraction({
+      const { escrowContractId } = validate(updateEscrowSchema, req.body);
+      const pool = require("../db/pool");
+      const { rows: acceptedApplications } = await pool.query(
+        "SELECT bid_amount FROM applications WHERE job_id = $1 AND status = 'accepted' LIMIT 1",
+        [req.params.id],
+      );
+      const options = acceptedApplications.length
+        ? { amount: acceptedApplications[0].bid_amount }
+        : {};
+      const job = await updateJobEscrowId(req.params.id, escrowContractId, options);
+      logContractInteraction({
         functionName: "create_escrow",
         callerAddress: req.user.publicKey,
         jobId: req.params.id,
         txHash: escrowContractId,
       });
+      await cache.invalidateJobListCache();
       res.json({ success: true, data: job });
     } catch (e) {
       next(e);
     }
   },
 );
-
-// PATCH /api/jobs/:id/boost — boost a job listing for 7 days
-router.patch("/:id/boost", verifyJWT, generalJobRateLimiter, async (req, res, next) => {
+ 
+// POST /api/jobs/:id/boost — boost a job listing for 7 days
+router.post("/:id/boost", verifyJWT, generalJobRateLimiter, async (req, res, next) => {
   try {
     const { txHash, amountXlm } = req.body;
     if (!txHash || typeof txHash !== "string") {
-      return res.status(400).json({ success: false, error: "Transaction hash is required" });
+      return res.status(400).json({ error: "Transaction hash is required" });
     }
-
+ 
+    const amount = parseFloat(amountXlm) || 0;
+    if (amount < 5) {
+      return res.status(400).json({ success: false, error: "Minimum boost amount is 5 XLM" });
+    }
+ 
+    // Verify on-chain via Horizon
+    const server = new Horizon.Server(process.env.HORIZON_URL || "https://horizon-testnet.stellar.org");
+    
+    const verifyTx = async () => {
+      const tx = await server.transactions().transaction(txHash).call();
+      if (!tx.successful) {
+        throw new Error("Transaction was not successful on-chain");
+      }
+      const { records: ops } = await tx.operations();
+      const paymentOp = ops.find(
+        (op) =>
+          op.type === "payment" &&
+          op.asset_type === "native" &&
+          op.from === req.user.publicKey &&
+          parseFloat(op.amount) >= amount
+      );
+      if (!paymentOp) {
+        throw new Error("Valid payment operation not found in transaction");
+      }
+      return paymentOp;
+    };
+ 
+    try {
+      await horizonClient.callWithLimit(verifyTx, "verifyBoostPayment");
+    } catch (err) {
+      return res.status(400).json({ success: false, error: err.message || "Failed to verify transaction" });
+    }
+ 
     // Determine boost duration from payment amount
     // 5 XLM = 7 days, 15 XLM = 30 days
-    const amount = parseFloat(amountXlm) || 0;
     const boostDays = amount >= 15 ? 30 : 7;
-
+ 
     const job = await boostJob(req.params.id, txHash, boostDays);
+    await cache.invalidateJobListCache();
     res.json({ success: true, data: job });
   } catch (e) { next(e); }
 });
-
+ 
 // GET /api/jobs/:id/analytics — job performance analytics
 router.get("/:id/analytics", generalJobRateLimiter, async (req, res, next) => {
   try {
@@ -532,7 +682,7 @@ router.get("/:id/analytics", generalJobRateLimiter, async (req, res, next) => {
     next(e);
   }
 });
-
+ 
 // PATCH /api/jobs/:id/extend — extend job expiry with XLM fee
 // Validates: only job owner, max 90-day total extension, charges 0.5 XLM per 7-day block
 router.patch(
@@ -541,38 +691,30 @@ router.patch(
   generalJobRateLimiter,
   async (req, res, next) => {
     try {
-      const { days } = req.body;
-      const validDays = [7, 14, 30];
+      const { days } = validate(extendJobSchema, req.body);
       const daysNum = parseInt(days, 10) || 30;
-      if (!validDays.includes(daysNum)) {
-        return res.status(400).json({
-          success: false,
-          error: "Extension days must be 7, 14, or 30",
-        });
-      }
       const job = await extendJobExpiry(req.params.id, daysNum, req.user.publicKey);
+      await cache.invalidateJobListCache();
       res.json({ success: true, data: job });
     } catch (e) {
       next(e);
     }
   },
 );
-
+ 
 // POST /api/jobs/:id/referral — track a referral click
 router.post("/:id/referral", generalJobRateLimiter, async (req, res, next) => {
   try {
     const { referrer } = req.body;
     if (!referrer)
-      return res
-        .status(400)
-        .json({ success: false, error: "Referrer address is required" });
+      return res.status(400).json({ error: "Referrer address is required" });
     await incrementShareCount(req.params.id);
     res.json({ success: true });
   } catch (e) {
     next(e);
   }
 });
-
+ 
 // DELETE /api/jobs/:id — roll back an orphaned job (escrow failed after creation)
 router.delete(
   "/:id",
@@ -587,29 +729,20 @@ router.delete(
     }
   },
 );
-
+ 
 // POST /api/jobs/:id/report — report a job
 router.post("/:id/report", reportJobRateLimiter, (req, res, next) => {
   try {
-    const { reporterAddress, category, description } = req.body;
+    const { reporterAddress, category, description } = validate(reportJobSchema, req.body);
     const jobId = req.params.id;
     const normalizedReporterAddress = normalizeAddress(reporterAddress);
-
+ 
     if (!normalizedReporterAddress)
-      return res
-        .status(400)
-        .json({ success: false, error: "Reporter address is required" });
-    if (!isValidReportCategory(category))
-      return res
-        .status(400)
-        .json({ success: false, error: "Valid report category is required" });
-
+      return res.status(400).json({ error: "Reporter address is required" });
     const duplicateKey = `${jobId}:${normalizedReporterAddress}`;
     if (jobReports.has(duplicateKey))
-      return res
-        .status(409)
-        .json({ success: false, error: "You have already reported this job" });
-
+      return res.status(409).json({ error: "You have already reported this job" });
+ 
     const report = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
       jobId,
@@ -621,7 +754,7 @@ router.post("/:id/report", reportJobRateLimiter, (req, res, next) => {
           : "",
       createdAt: new Date().toISOString(),
     };
-
+ 
     jobReports.set(duplicateKey, report);
     res.status(201).json({
       success: true,
@@ -632,7 +765,7 @@ router.post("/:id/report", reportJobRateLimiter, (req, res, next) => {
     next(e);
   }
 });
-
+ 
 // POST /api/jobs/:id/dispute — raise a dispute for an in-progress job
 router.post(
   "/:id/dispute",
@@ -643,10 +776,7 @@ router.post(
     try {
       const { reason, description } = req.body;
       if (!reason || !description) {
-        return res.status(400).json({
-          success: false,
-          error: "Reason and description are required",
-        });
+        return res.status(400).json({ error: "Reason and description are required" });
       }
       const job = await raiseDispute(req.params.id, {
         reason,
@@ -659,7 +789,7 @@ router.post(
     }
   },
 );
-
+ 
 // POST /api/jobs/:id/resolve — resolve a dispute (Admin only)
 router.post(
   "/:id/resolve",
@@ -670,19 +800,18 @@ router.post(
       // Basic admin check - in a real app this would be more robust
       const adminKey = process.env.ADMIN_PUBLIC_KEY;
       if (adminKey && req.user.publicKey !== adminKey) {
-        return res
-          .status(403)
-          .json({ success: false, error: "Only admins can resolve disputes" });
+        return res.status(403).json({ error: "Only admins can resolve disputes" });
       }
-
+ 
       const job = await resolveDispute(req.params.id);
+      scheduleReputationRecalcForJob(req.params.id);
       res.json({ success: true, data: job });
     } catch (e) {
       next(e);
     }
   },
 );
-
+ 
 // GET /api/jobs/feed.rss — RSS 2.0 feed
 router.get("/feed.rss", generalJobRateLimiter, async (req, res, next) => {
   try {
@@ -695,7 +824,7 @@ router.get("/feed.rss", generalJobRateLimiter, async (req, res, next) => {
       jobs.length > 0
         ? formatDateRss(new Date(jobs[0].createdAt))
         : formatDateRss(new Date());
-
+ 
     let rss = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/elements/1.1/">
   <channel>
@@ -706,7 +835,7 @@ router.get("/feed.rss", generalJobRateLimiter, async (req, res, next) => {
     <language>en-us</language>
     <lastBuildDate>${lastBuildDate}</lastBuildDate>
 `;
-
+ 
     jobs.forEach((job) => {
       const jobUrl = `${baseUrl}/jobs/${job.id}`;
       const pubDate = formatDateRss(new Date(job.createdAt));
@@ -724,17 +853,17 @@ router.get("/feed.rss", generalJobRateLimiter, async (req, res, next) => {
     </item>
 `;
     });
-
+ 
     rss += `  </channel>
 </rss>`;
-
+ 
     res.set("Content-Type", "application/rss+xml; charset=utf-8");
     res.send(rss);
   } catch (e) {
     next(e);
   }
 });
-
+ 
 // GET /api/jobs/feed.atom
 router.get("/feed.atom", generalJobRateLimiter, async (req, res, next) => {
   try {
@@ -747,7 +876,7 @@ router.get("/feed.atom", generalJobRateLimiter, async (req, res, next) => {
       jobs.length > 0
         ? formatDateAtom(new Date(jobs[0].createdAt))
         : formatDateAtom(new Date());
-
+ 
     let atom = `<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
   <title>${escapeXml(`Stellar MarketPay — Job Listings${feedTitleSuffix({ category, skills })}`)}</title>
@@ -757,7 +886,7 @@ router.get("/feed.atom", generalJobRateLimiter, async (req, res, next) => {
   <updated>${updatedDate}</updated>
   <id>${feedUrl}</id>
 `;
-
+ 
     jobs.forEach((job) => {
       const jobUrl = `${baseUrl}/jobs/${job.id}`;
       const published = formatDateAtom(new Date(job.createdAt));
@@ -776,7 +905,7 @@ router.get("/feed.atom", generalJobRateLimiter, async (req, res, next) => {
   </entry>
 `;
     });
-
+ 
     atom += `</feed>`;
     res.set("Content-Type", "application/atom+xml; charset=utf-8");
     res.send(atom);
@@ -784,7 +913,7 @@ router.get("/feed.atom", generalJobRateLimiter, async (req, res, next) => {
     next(e);
   }
 });
-
+ 
 // GET /api/jobs/drafts — list job drafts for authenticated user
 router.get("/drafts", verifyJWT, async (req, res, next) => {
   try {
@@ -794,7 +923,7 @@ router.get("/drafts", verifyJWT, async (req, res, next) => {
     next(e);
   }
 });
-
+ 
 // POST /api/jobs/drafts — save or update a job draft
 router.post("/drafts", verifyJWT, async (req, res, next) => {
   try {
@@ -804,7 +933,7 @@ router.post("/drafts", verifyJWT, async (req, res, next) => {
     next(e);
   }
 });
-
+ 
 // GET /api/jobs/drafts/:id — get a specific draft
 router.get("/drafts/:id", verifyJWT, async (req, res, next) => {
   try {
@@ -813,13 +942,13 @@ router.get("/drafts/:id", verifyJWT, async (req, res, next) => {
       req.user.publicKey,
     );
     if (!draft)
-      return res.status(404).json({ success: false, error: "Draft not found" });
+      return res.status(404).json({ error: "Draft not found" });
     res.json({ success: true, data: draft });
   } catch (e) {
     next(e);
   }
 });
-
+ 
 // DELETE /api/jobs/drafts/:id — delete a draft
 router.delete("/drafts/:id", verifyJWT, async (req, res, next) => {
   try {
@@ -829,7 +958,7 @@ router.delete("/drafts/:id", verifyJWT, async (req, res, next) => {
     next(e);
   }
 });
-
+ 
 // PUT /api/jobs/drafts/:id — upsert a job draft (partial data)
 router.put("/drafts/:id", verifyJWT, async (req, res, next) => {
   try {
@@ -841,7 +970,7 @@ router.put("/drafts/:id", verifyJWT, async (req, res, next) => {
     next(e);
   }
 });
-
+ 
 // GET /api/jobs/recommended — get personalized job recommendations
 router.get("/recommended", verifyJWT, async (req, res, next) => {
   try {
@@ -855,7 +984,7 @@ router.get("/recommended", verifyJWT, async (req, res, next) => {
     next(e);
   }
 });
-
+ 
 // GET /api/jobs/suggest — get job suggestions for autocomplete
 router.get("/suggest", suggestRateLimiter, async (req, res, next) => {
   try {
@@ -864,7 +993,7 @@ router.get("/suggest", suggestRateLimiter, async (req, res, next) => {
     res.json({ success: true, data: suggestions });
   } catch (e) { next(e); }
 });
-
+ 
 // GET /api/analytics/categories — stats per category
 router.get(
   "/analytics/categories",
@@ -879,7 +1008,7 @@ router.get(
     }
   },
 );
-
+ 
 // GET /api/analytics/overview — platform-wide totals
 router.get(
   "/analytics/overview",
@@ -894,7 +1023,52 @@ router.get(
     }
   },
 );
-
+ 
+// POST /api/jobs/batch — unified batch endpoint for bulk operations (#869)
+router.post(
+  "/batch",
+  verifyJWT,
+  jobCreationRateLimiter,
+  async (req, res, next) => {
+    try {
+      const { action, ids } = req.body;
+      
+      // Validate input
+      if (!action || !["close", "delete"].includes(action)) {
+        return res.status(400).json({ 
+          success: false,
+          error: "action must be 'close' or 'delete'" 
+        });
+      }
+      
+      if (!Array.isArray(ids) || ids.length === 0) {
+        return res.status(400).json({ 
+          success: false,
+          error: "ids must be a non-empty array" 
+        });
+      }
+      
+      if (ids.length > 50) {
+        return res.status(400).json({ 
+          success: false,
+          error: "Maximum 50 IDs per batch request" 
+        });
+      }
+ 
+      const { batchJobOperation } = require("../services/jobService");
+      const result = await batchJobOperation(action, ids, req.user.publicKey);
+      
+      res.json({
+        success: true,
+        succeeded: result.succeeded,
+        failed: result.failed,
+      });
+    } catch (e) {
+      next(e);
+    }
+  },
+);
+ 
 // POST /api/jobs/bulk-cancel — cancel multiple open jobs at once
 router.post(
   "/bulk-cancel",
@@ -904,9 +1078,7 @@ router.post(
     try {
       const { jobIds } = req.body;
       if (!Array.isArray(jobIds) || jobIds.length === 0) {
-        return res
-          .status(400)
-          .json({ success: false, error: "jobIds must be a non-empty array" });
+        return res.status(400).json({ error: "jobIds must be a non-empty array" });
       }
       const { bulkCancelJobs } = require("../services/jobService");
       const results = await bulkCancelJobs(jobIds, req.user.publicKey);
@@ -921,7 +1093,7 @@ router.post(
     }
   },
 );
-
+ 
 // POST /api/jobs/bulk-extend — extend expiry for multiple jobs at once
 router.post(
   "/bulk-extend",
@@ -931,9 +1103,7 @@ router.post(
     try {
       const { jobIds, days } = req.body;
       if (!Array.isArray(jobIds) || jobIds.length === 0) {
-        return res
-          .status(400)
-          .json({ success: false, error: "jobIds must be a non-empty array" });
+        return res.status(400).json({ error: "jobIds must be a non-empty array" });
       }
       const { bulkExtendJobs } = require("../services/jobService");
       const results = await bulkExtendJobs(
@@ -952,7 +1122,7 @@ router.post(
     }
   },
 );
-
+ 
 // POST /api/jobs/bulk-boost — boost multiple jobs at once
 router.post(
   "/bulk-boost",
@@ -962,14 +1132,10 @@ router.post(
     try {
       const { jobIds, txHash } = req.body;
       if (!Array.isArray(jobIds) || jobIds.length === 0) {
-        return res
-          .status(400)
-          .json({ success: false, error: "jobIds must be a non-empty array" });
+        return res.status(400).json({ error: "jobIds must be a non-empty array" });
       }
       if (!txHash) {
-        return res
-          .status(400)
-          .json({ success: false, error: "txHash is required for bulk boost" });
+        return res.status(400).json({ error: "txHash is required for bulk boost" });
       }
       const { bulkBoostJobs } = require("../services/jobService");
       const results = await bulkBoostJobs(jobIds, req.user.publicKey, txHash);
@@ -984,5 +1150,27 @@ router.post(
     }
   },
 );
+// GET /api/jobs/analytics/categories — stats per category
+router.get("/analytics/categories", generalJobRateLimiter, async (req, res, next) => {
+  try {
+    const { getCategoryAnalytics } = require("../services/jobService");
+    const data = await getCategoryAnalytics();
+    res.json({ success: true, data });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// GET /api/jobs/analytics/overview — platform-wide totals
+router.get("/analytics/overview", generalJobRateLimiter, async (req, res, next) => {
+  try {
+    const { getAnalyticsOverview } = require("../services/jobService");
+    const data = await getAnalyticsOverview();
+    res.json({ success: true, data });
+  } catch (e) {
+    next(e);
+  }
+});
 
 module.exports = router;
+ 

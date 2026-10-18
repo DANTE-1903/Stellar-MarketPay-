@@ -1,6 +1,11 @@
 /**
  * routes/savedSearches.js
  * CRUD endpoints for saved job search alerts (Issue #284).
+ *
+ * @swagger
+ * tags:
+ *   name: Saved Searches
+ *   description: Saved job search alerts
  */
 "use strict";
 
@@ -14,13 +19,46 @@ const logger = createServiceLogger("saved-searches");
 const MAX_SAVED_SEARCHES = 10;
 
 /**
- * GET /api/saved-searches
- * List the authenticated user's saved searches.
+ * @swagger
+ * /api/saved-searches:
+ *   get:
+ *     summary: List saved searches
+ *     tags: [Saved Searches]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Saved searches list
+ *   post:
+ *     summary: Save a new search (max 10)
+ *     tags: [Saved Searches]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - query_params
+ *             properties:
+ *               query_params:
+ *                 type: object
+ *               notify_in_app:
+ *                 type: boolean
+ *               notify_email:
+ *                 type: boolean
+ *     responses:
+ *       201:
+ *         description: Search saved
+ *       400:
+ *         description: Limit reached or invalid params
  */
 router.get("/", verifyJWT, async (req, res, next) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, user_address, query_params, notify_in_app, notify_email, last_notified_at, created_at, updated_at
+      `SELECT id, user_address, query_params, notify_in_app, notify_email, active, deleted_at, last_notified_at, created_at, updated_at
        FROM saved_searches
        WHERE user_address = $1
        ORDER BY created_at DESC`,
@@ -41,7 +79,7 @@ router.post("/", verifyJWT, async (req, res, next) => {
     const { query_params, notify_in_app, notify_email } = req.body;
 
     if (!query_params || typeof query_params !== "object") {
-      return res.status(400).json({ success: false, error: "query_params is required and must be an object" });
+      return res.status(400).json({ error: "query_params is required and must be an object" });
     }
 
     // Check limit
@@ -51,15 +89,14 @@ router.post("/", verifyJWT, async (req, res, next) => {
     );
     if (Number(countResult.rows[0].cnt) >= MAX_SAVED_SEARCHES) {
       return res.status(400).json({
-        success: false,
         error: `You can save up to ${MAX_SAVED_SEARCHES} searches. Please delete one first.`,
       });
     }
 
     const { rows } = await pool.query(
-      `INSERT INTO saved_searches (user_address, query_params, notify_in_app, notify_email)
-       VALUES ($1, $2::jsonb, $3, $4)
-       RETURNING id, user_address, query_params, notify_in_app, notify_email, last_notified_at, created_at, updated_at`,
+      `INSERT INTO saved_searches (user_address, query_params, notify_in_app, notify_email, active)
+       VALUES ($1, $2::jsonb, $3, $4, TRUE)
+       RETURNING id, user_address, query_params, notify_in_app, notify_email, active, deleted_at, last_notified_at, created_at, updated_at`,
       [
         req.user.publicKey,
         JSON.stringify(query_params),
@@ -76,26 +113,73 @@ router.post("/", verifyJWT, async (req, res, next) => {
 });
 
 /**
- * PATCH /api/saved-searches/:id
- * Update notification preferences for a saved search.
+ * @swagger
+ * /api/saved-searches/{id}:
+ *   patch:
+ *     summary: Update saved search notification prefs
+ *     tags: [Saved Searches]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Search updated
+ *   delete:
+ *     summary: Delete a saved search
+ *     tags: [Saved Searches]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Search deleted
  */
 router.patch("/:id", verifyJWT, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { notify_in_app, notify_email } = req.body;
+    const { notify_in_app, notify_email, active } = req.body;
+
+    if (active !== undefined && typeof active !== "boolean") {
+      return res.status(400).json({ error: "active must be a boolean" });
+    }
+
+    const hasActiveUpdate = typeof active === "boolean";
+    const query = hasActiveUpdate
+      ? `UPDATE saved_searches
+         SET notify_in_app = COALESCE($1, notify_in_app),
+             notify_email = COALESCE($2, notify_email),
+             active = $3,
+             deleted_at = CASE WHEN $3 = FALSE THEN COALESCE(deleted_at, NOW()) ELSE NULL END,
+             updated_at = NOW()
+         WHERE id = $4 AND user_address = $5 AND deleted_at IS NULL
+         RETURNING id, user_address, query_params, notify_in_app, notify_email, active, deleted_at, last_notified_at, created_at, updated_at`
+      : `UPDATE saved_searches
+         SET notify_in_app = COALESCE($1, notify_in_app),
+             notify_email = COALESCE($2, notify_email),
+             updated_at = NOW()
+         WHERE id = $3 AND user_address = $4
+         RETURNING id, user_address, query_params, notify_in_app, notify_email, active, deleted_at, last_notified_at, created_at, updated_at`;
+    const params = hasActiveUpdate
+      ? [notify_in_app, notify_email, active, id, req.user.publicKey]
+      : [notify_in_app, notify_email, id, req.user.publicKey];
 
     const { rows } = await pool.query(
-      `UPDATE saved_searches
-       SET notify_in_app = COALESCE($1, notify_in_app),
-           notify_email = COALESCE($2, notify_email),
-           updated_at = NOW()
-       WHERE id = $3 AND user_address = $4
-       RETURNING id, user_address, query_params, notify_in_app, notify_email, last_notified_at, created_at, updated_at`,
-      [notify_in_app, notify_email, id, req.user.publicKey]
+      query,
+      params
     );
 
     if (rows.length === 0) {
-      return res.status(404).json({ success: false, error: "Saved search not found" });
+      return res.status(404).json({ error: "Saved search not found" });
     }
 
     res.json({ success: true, data: rows[0] });
@@ -117,7 +201,7 @@ router.delete("/:id", verifyJWT, async (req, res, next) => {
     );
 
     if (result.rowCount === 0) {
-      return res.status(404).json({ success: false, error: "Saved search not found" });
+      return res.status(404).json({ error: "Saved search not found" });
     }
 
     logger.info({ userId: req.user.publicKey, searchId: id }, "Saved search deleted");

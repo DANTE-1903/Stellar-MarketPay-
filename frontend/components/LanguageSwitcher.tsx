@@ -2,6 +2,7 @@
  * components/LanguageSwitcher.tsx
  * Navbar language selector with localStorage persistence (#282).
  */
+import { useRouter } from "next/router";
 import { useTranslation } from "@/lib/i18n";
 
 const LOCALES = [
@@ -11,17 +12,26 @@ const LOCALES = [
   { code: "pt", labelKey: "language.portuguese" },
 ] as const;
 
+export const LOCALE_STORAGE_KEY = "stellar-marketpay:locale";
+
 interface LanguageSwitcherProps {
   className?: string;
 }
 
 export default function LanguageSwitcher({ className = "" }: LanguageSwitcherProps) {
+  const router = useRouter();
   const { t, i18n } = useTranslation("common");
 
-  const switchLanguage = (lang: string) => {
-    i18n.changeLanguage(lang);
+  const switchLanguage = async (lang: string) => {
+    await i18n.changeLanguage(lang);
     if (typeof window !== "undefined") {
-      localStorage.setItem("preferredLocale", lang);
+      localStorage.setItem(LOCALE_STORAGE_KEY, lang);
+    }
+
+    // Keep Next.js locale routing in sync with the next-i18next instance while
+    // preserving the current path, query string, and hash.
+    if (router.locale !== lang) {
+      await router.push(router.asPath, router.asPath, { locale: lang });
     }
   };
 

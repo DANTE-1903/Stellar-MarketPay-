@@ -153,16 +153,16 @@ export default function ClientSpendingTab({ analytics, loading, xlmPriceUsd }: P
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
           <p className="font-display text-lg text-amber-100">Monthly Spend</p>
           <div className="flex flex-wrap items-center gap-2">
-            <label className="text-xs text-amber-700">From</label>
-            <input
+            <label htmlFor="from" className="text-xs text-amber-700">From</label>
+            <input id="from"
               type="month"
               value={fromDate ? fromDate.slice(0, 7) : ""}
               onChange={(e) => setFromDate(e.target.value ? `${e.target.value}-01` : "")}
               className="rounded-lg border border-market-500/20 bg-ink-700 px-2 py-1 text-xs text-amber-100 focus:outline-none focus:ring-1 focus:ring-market-400/40"
               aria-label="From month"
             />
-            <label className="text-xs text-amber-700">To</label>
-            <input
+            <label htmlFor="to" className="text-xs text-amber-700">To</label>
+            <input id="to"
               type="month"
               value={toDate ? toDate.slice(0, 7) : ""}
               onChange={(e) => setToDate(e.target.value ? `${e.target.value}-01` : "")}
@@ -184,14 +184,14 @@ export default function ClientSpendingTab({ analytics, loading, xlmPriceUsd }: P
         ) : (
           <ResponsiveContainer width="100%" height={200}>
             <BarChart data={filteredMonthly} margin={{ top: 4, right: 4, bottom: 4, left: 0 }}>
-              <XAxis dataKey="month" tick={{ fill: "#a8956a", fontSize: 11 }} axisLine={false} tickLine={false} />
+              <XAxis dataKey="month" interval={3} tick={{ fill: "#a8956a", fontSize: 11 }} axisLine={false} tickLine={false} />
               <YAxis tick={{ fill: "#a8956a", fontSize: 11 }} axisLine={false} tickLine={false} />
               <Tooltip
                 contentStyle={{ background: "#1a1610", border: "1px solid rgba(245,158,11,0.15)", borderRadius: 8, color: "#fef3c7", fontSize: 12 }}
                 formatter={(value) => [`${Number(value).toFixed(2)} XLM`, "Spent"]}
                 cursor={{ fill: "rgba(245,158,11,0.06)" }}
               />
-              <Bar dataKey="total" fill="#f59e0b" radius={[4, 4, 0, 0]} />
+              <Bar dataKey="total" fill="#f59e0b" radius={[4, 4, 0, 0]} barSize={24} />
             </BarChart>
           </ResponsiveContainer>
         )}

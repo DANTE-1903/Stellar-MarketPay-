@@ -3,41 +3,52 @@
  * User dashboard — shows posted jobs, applications, and wallet balance.
  */
 import { useState, useEffect, useCallback, useRef } from "react";
+import type { ReactNode } from "react";
 import Link from "next/link";
 import { useRouter } from "next/router";
 import WalletConnect from "@/components/WalletConnect";
-import { fetchMyJobs, fetchMyApplications, fetchApplications, fetchMyInvitations, declineInvitation } from "@/lib/api";
+import {
+  fetchMyJobs, fetchMyApplications, fetchApplications, fetchMyInvitations, declineInvitation,
+  fetchProposalTemplates, fetchProfile,
+  fetchClientSpendingAnalytics, fetchPriceAlertPreference, upsertPriceAlertPreference,
+  fetchSavedSearches, updateSavedSearch, deleteSavedSearch,
+  createProposalTemplate, updateProposalTemplate, deleteProposalTemplate,
+  fetchTalentPool,
+  batchJobOperation, bulkExtendJobs,
+} from "@/lib/api";
 import { getXLMBalance, getUSDCBalance, streamAccountTransactions } from "@/lib/stellar";
-import { formatXLM, shortenAddress, timeAgo, statusLabel, statusClass, copyToClipboard, exportJobsToCSV, exportApplicationsToCSV } from "@/utils/format";
-import type { Job, Application, ClientSpendingAnalytics, JobInvitation } from "@/utils/types";
+import { formatXLM, shortenAddress, copyToClipboard } from "@/utils/format";
+import type { Job, Application, ClientSpendingAnalytics, JobInvitation, BulkActionResponse } from "@/utils/types";
+import type { TalentPoolEntry } from "@/lib/api";
 import EditProfileForm from "@/components/EditProfileForm";
 import SendPaymentForm from "@/components/SendPaymentForm";
+import WalletAddressDisplay from "@/components/WalletAddressDisplay";
 import { useToast } from "@/components/Toast";
 import clsx from "clsx";
 import dynamic from "next/dynamic";
-import JobTimeline from "@/components/JobTimeline";
 import BulkJobActionBar from "@/components/BulkJobActionBar";
-import JobStatusTimeline from "@/components/JobStatusTimeline";
 import ExtendJobModal from "@/components/ExtendJobModal";
 import ClientSpendingTab from "@/components/ClientSpendingTab";
 import EarningsChart from "@/components/EarningsChart";
 import PostedJobsTab from "@/components/dashboard-tabs/PostedJobsTab";
 import AppliedJobsTab from "@/components/dashboard-tabs/AppliedJobsTab";
 import InvitationsTab from "@/components/dashboard-tabs/InvitationsTab";
+import TemplatesTab from "@/components/dashboard-tabs/TemplatesTab";
+import PriceAlertsTab from "@/components/dashboard-tabs/PriceAlertsTab";
+import WithdrawalsTab from "@/components/dashboard-tabs/WithdrawalsTab";
+import SavedSearchesTab from "@/components/dashboard-tabs/SavedSearchesTab";
+import AnalyticsTab from "@/components/dashboard-tabs/AnalyticsTab";
+import SwapEarningsTab from "@/components/dashboard-tabs/SwapEarningsTab";
+import ProposalComparison from "@/components/ProposalComparison";
+import TalentPoolTab from "@/components/dashboard-tabs/TalentPoolTab";
 import { usePriceContext } from "@/contexts/PriceContext";
 import ProfileCompletenessWidget from "@/components/ProfileCompletenessWidget";
 import { useOnboarding } from "@/hooks/useOnboarding";
 import XlmPriceWidget from "@/components/XlmPriceWidget";
-import StateMessage from "@/components/StateMessage";
 import BuyXLMModal from "@/components/BuyXLMModal";
 import WithdrawToBankModal from "@/components/WithdrawToBankModal";
 
 // Dynamic imports for heavy components
-const JobAnalytics = dynamic(() => import("@/components/JobAnalytics"), {
-  loading: () => <div className="animate-pulse bg-market-900/30 h-64 rounded-xl" />,
-  ssr: false,
-});
-
 const ReferralDashboard = dynamic(() => import("@/components/ReferralDashboard"), {
   loading: () => <div className="animate-pulse bg-market-900/30 h-64 rounded-xl" />,
   ssr: false,
@@ -60,7 +71,7 @@ interface DashboardProps {
   onConnect: (pk: string) => void;
 }
 
-type Tab = "posted" | "applied" | "invitations" | "analytics" | "earnings" | "spending" | "send" | "edit_profile" | "templates" | "price_alerts" | "withdrawals" | "saved_searches" | "referrals";
+type Tab = "posted" | "applied" | "proposals" | "invitations" | "analytics" | "earnings" | "swap" | "spending" | "send" | "edit_profile" | "templates" | "price_alerts" | "withdrawals" | "saved_searches" | "referrals" | "talent_pool";
 const REPOST_JOB_PREFILL_STORAGE_KEY = "marketpay_repost_job_prefill";
 
 async function fetchBalances(
@@ -111,13 +122,13 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
   const [canViewSpending, setCanViewSpending] = useState(true);
   const [myJobs, setMyJobs] = useState<Job[]>([]);
   const [myApplications, setMyApplications] = useState<Application[]>([]);
+  const [jobApplications, setJobApplications] = useState<Map<string, Application[]>>(new Map());
   const [myInvitations, setMyInvitations] = useState<JobInvitation[]>([]);
+  const [talentPool, setTalentPool] = useState<TalentPoolEntry[]>([]);
   const [balance, setBalance]           = useState<string | null>(null);
   const [usdcBalance, setUsdcBalance]   = useState<string | null>(null);
   const [notificationCount, setNotificationCount] = useState(0);
   const [loading, setLoading] = useState(true);
-  const [copied, setCopied] = useState(false);
-  const [copyError, setCopyError] = useState(false);
   const latestJobsRef = useRef<Job[]>([]);
   const latestApplicationsRef = useRef<Application[]>([]);
   const latestJobApplicationsRef = useRef<Map<string, Application[]>>(new Map());
@@ -126,74 +137,165 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
   const [selectedJobIds, setSelectedJobIds] = useState<Set<string>>(new Set());
   const [bulkLoading, setBulkLoading] = useState(false);
   const [extendModalJob, setExtendModalJob] = useState<Job | null>(null);
+  const [confirmDeleteTemplate, setConfirmDeleteTemplate] = useState<string | null>(null);
+  const [confirmDeleteSearch, setConfirmDeleteSearch] = useState<string | null>(null);
+
+  // ── Missing state declarations (referenced throughout component) ──────────
+  const [showWithdraw, setShowWithdraw] = useState(false);
+  const [showBuyXLM, setShowBuyXLM] = useState(false);
+  const [withdrawHistory, setWithdrawHistory] = useState<Array<{ id: string; amount: string; asset: string; fiatCurrency: string }>>([]);
+  const [spendingAnalytics, setSpendingAnalytics] = useState<ClientSpendingAnalytics | null>(null);
+  const [spendingLoading, setSpendingLoading] = useState(false);
+  const [savedSearches, setSavedSearches] = useState<Array<{ id: string; query_params: Record<string, string>; notify_in_app: boolean; notify_email: boolean; created_at: string }>>([]);
+  const [savedSearchesLoading, setSavedSearchesLoading] = useState(false);
+  const [templates, setTemplates] = useState<Array<{ id: string; name: string; content: string }>>([]);
+  const [templateName, setTemplateName] = useState("");
+  const [templateContent, setTemplateContent] = useState("");
+  const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
+  const [minPrice, setMinPrice] = useState("");
+  const [maxPrice, setMaxPrice] = useState("");
+  const [emailEnabled, setEmailEnabled] = useState(false);
+  const [alertEmail, setAlertEmail] = useState("");
+  const [selectedJob, setSelectedJob] = useState<Job | null>(null);
+  const [alertMatchesDismissed, setAlertMatchesDismissed] = useState(false);
+  const [alertMatches, setAlertMatches] = useState<Job[]>([]);
+  const [extendingJob, setExtendingJob] = useState<string | null>(null);
+
+  // ── Destructure onboarding progress ──────────────────────────────────────
+  const { checklistItems, progress } = useOnboarding(publicKey);
+
+  // ── Derived values ────────────────────────────────────────────────────────
+  const { xlmPriceUsd } = usePriceContext();
+  const { success } = toast;
+  const router = useRouter();
+
+  // ── Missing local helpers ─────────────────────────────────────────────────
+  function loadWithdrawHistory(): Array<{ id: string; amount: string; asset: string; fiatCurrency: string }> {
+    try {
+      const raw = typeof window !== "undefined" ? localStorage.getItem("marketpay_withdraw_history") : null;
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  const refreshBalances = useCallback(async () => {
+    if (!publicKey) return;
+    try {
+      const [xlm, usdc] = await Promise.all([
+        getXLMBalance(publicKey),
+        getUSDCBalance(publicKey),
+      ]);
+      setBalance(xlm);
+      setUsdcBalance(usdc);
+    } catch {
+      // ignore
+    }
+  }, [publicKey]);
+
+  const handleExtendJob = useCallback((jobId: string) => {
+    setExtendingJob(jobId);
+    const job = myJobs.find((j) => j.id === jobId) ?? null;
+    setExtendModalJob(job);
+  }, [myJobs]);
+
+  const handleRepost = useCallback((job: Job) => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem(REPOST_JOB_PREFILL_STORAGE_KEY, JSON.stringify(job));
+    }
+    router.push("/post-job");
+  }, [router]);
+
+  const handleResetContractMock = useCallback(() => {
+    if (typeof window !== "undefined") {
+      Object.keys(localStorage)
+        .filter((k) => k.startsWith("mock_escrow_"))
+        .forEach((k) => localStorage.removeItem(k));
+    }
+  }, []);
+
 
   const handleJobExtended = useCallback((updated: Job) => {
     setMyJobs((prev) => prev.map((j) => (j.id === updated.id ? updated : j)));
     setExtendModalJob(null);
   }, []);
 
+  const bulkResult = useCallback(
+    (ids: string[], ok: boolean): BulkActionResponse => ({
+      success: ok,
+      succeeded: ok ? ids.length : 0,
+      failed: ok ? 0 : ids.length,
+      processedCount: ids.length,
+      failedCount: ok ? 0 : ids.length,
+      results: ids.map((id) => ({ id, success: ok })),
+    }),
+    [],
+  );
+
+  // Issue #868: Wire up bulk actions with the unified batch API
   const handleBulkCancel = useCallback(async () => {
     setBulkLoading(true);
     try {
       const ids = Array.from(selectedJobIds);
-      await Promise.all(ids.map((id) => fetch(`/api/jobs/${id}/cancel`, { method: "POST" })));
+      const result = await batchJobOperation("close", ids);
+      await refreshDashboard();
       setSelectedJobIds(new Set());
-      return { success: ids.length, failed: 0 };
-    } catch {
-      return { success: 0, failed: selectedJobIds.size };
+      return {
+        results: [
+          ...result.succeeded.map((s) => ({ id: s.id, success: true })),
+          ...result.failed.map((f) => ({ id: f.id, success: false, error: f.error })),
+        ],
+        succeeded: result.succeeded.length,
+        failed: result.failed.length,
+      };
+    } catch (error) {
+      console.error("Bulk cancel failed:", error);
+      return bulkResult(Array.from(selectedJobIds), false);
     } finally {
       setBulkLoading(false);
     }
-  }, [selectedJobIds]);
+  }, [selectedJobIds, bulkResult]);
 
   const handleBulkExtend = useCallback(async () => {
     setBulkLoading(true);
     try {
       const ids = Array.from(selectedJobIds);
-      await Promise.all(ids.map((id) => fetch(`/api/jobs/${id}/extend`, { method: "POST" })));
+      const result = await bulkExtendJobs(ids, 30); // 30 days by default
+      await refreshDashboard();
       setSelectedJobIds(new Set());
-      return { success: ids.length, failed: 0 };
-    } catch {
-      return { success: 0, failed: selectedJobIds.size };
+      return result;
+    } catch (error) {
+      console.error("Bulk extend failed:", error);
+      return bulkResult(Array.from(selectedJobIds), false);
     } finally {
       setBulkLoading(false);
     }
-  }, [selectedJobIds]);
+  }, [selectedJobIds, bulkResult]);
 
   const handleBulkBoost = useCallback(async () => {
     setBulkLoading(true);
     try {
       const ids = Array.from(selectedJobIds);
-      await Promise.all(ids.map((id) => fetch(`/api/jobs/${id}/boost`, { method: "POST" })));
-      setSelectedJobIds(new Set());
-      return { success: ids.length, failed: 0 };
-    } catch {
-      return { success: 0, failed: selectedJobIds.size };
+      // For boost, we'd need a transaction hash from the user
+      // For now, return a placeholder that indicates payment is needed
+      toast.info("Boost requires payment. Feature coming soon!");
+      return bulkResult(ids, false);
+    } catch (error) {
+      console.error("Bulk boost failed:", error);
+      return bulkResult(Array.from(selectedJobIds), false);
     } finally {
       setBulkLoading(false);
     }
-  }, [selectedJobIds]);
-
-  const handleCopy = async () => {
-    if (!publicKey) return;
-    const ok = await copyToClipboard(publicKey);
-    if (ok) {
-      setCopied(true);
-      setCopyError(false);
-      setTimeout(() => setCopied(false), 2000);
-    } else {
-      setCopyError(true);
-      setTimeout(() => setCopyError(false), 2000);
-    }
-  };
+  }, [selectedJobIds, bulkResult, toast]);
 
   const loadDashboardData = useCallback(async () => {
     if (!publicKey) return null;
 
-    const [jobs, apps, invitations, bal, usdc] = await Promise.all([
+    const [jobs, apps, invitations, poolEntries, bal, usdc] = await Promise.all([
       fetchMyJobs(publicKey),
       fetchMyApplications(publicKey),
-      fetchMyInvitations().catch(() => []),
+      fetchMyInvitations().catch((): JobInvitation[] => []),
+      fetchTalentPool().catch(() => []),
       getXLMBalance(publicKey),
       getUSDCBalance(publicKey),
     ]);
@@ -211,7 +313,9 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
 
     setMyJobs(jobs);
     setMyApplications(apps);
+    setJobApplications(jobApplications);
     setMyInvitations(invitations);
+    setTalentPool(poolEntries);
     setBalance(bal);
     setUsdcBalance(usdc);
     latestJobsRef.current = jobs;
@@ -220,6 +324,11 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
 
     return { jobs, apps, jobApplications, invitations };
   }, [publicKey]);
+
+  // Reload all dashboard data (used after bulk actions).
+  const refreshDashboard = useCallback(async () => {
+    await loadDashboardData();
+  }, [loadDashboardData]);
 
   const pushNotification = useCallback(
     (key: string, message: string, variant: "success" | "info" = "info") => {
@@ -388,6 +497,203 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
     );
   }
 
+  // ── Tab content handlers ─────────────────────────────────────────────────
+  const handleSaveTemplate = async () => {
+    if (!templateName.trim() || !templateContent.trim()) return;
+    if (editingTemplateId) {
+      const updated = await updateProposalTemplate(
+        editingTemplateId,
+        { name: templateName, content: templateContent },
+      );
+      setTemplates((current) =>
+        current.map((item) => (item.id === updated.id ? updated : item)),
+      );
+      setEditingTemplateId(null);
+    } else {
+      const created = await createProposalTemplate({
+        name: templateName,
+        content: templateContent,
+      });
+      setTemplates((current) => [created, ...current]);
+    }
+    setTemplateName("");
+    setTemplateContent("");
+  };
+
+  const handleEditTemplate = (template: { id: string; name: string; content: string }) => {
+    setEditingTemplateId(template.id);
+    setTemplateName(template.name);
+    setTemplateContent(template.content);
+  };
+
+  const handleConfirmDeleteTemplate = async () => {
+    if (!confirmDeleteTemplate) return;
+    await deleteProposalTemplate(confirmDeleteTemplate);
+    setTemplates((current) =>
+      current.filter((item) => item.id !== confirmDeleteTemplate),
+    );
+    setConfirmDeleteTemplate(null);
+    success("Template deleted");
+  };
+
+  const handleDeclineInvitation = async (id: string) => {
+    try {
+      await declineInvitation(id);
+      setMyInvitations((prev) => prev.filter((i) => i.id !== id));
+      success("Invitation declined.");
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleSavePriceAlerts = async () => {
+    await upsertPriceAlertPreference(publicKey, {
+      minXlmPriceUsd: minPrice ? Number(minPrice) : null,
+      maxXlmPriceUsd: maxPrice ? Number(maxPrice) : null,
+      emailNotificationsEnabled: emailEnabled,
+      email: alertEmail,
+    });
+    success("Price alert settings saved");
+  };
+
+  const handleToggleSavedSearch = async (id: string) => {
+    try {
+      const current = savedSearches.find((s) => s.id === id);
+      if (!current) return;
+      const updated = await updateSavedSearch(id, {
+        notify_in_app: !current.notify_in_app,
+      });
+      setSavedSearches((prev) =>
+        prev.map((x) => (x.id === updated.id ? updated : x)),
+      );
+      success("Notification preference updated");
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleConfirmDeleteSearch = async () => {
+    if (!confirmDeleteSearch) return;
+    try {
+      await deleteSavedSearch(confirmDeleteSearch);
+      setSavedSearches((prev) => prev.filter((x) => x.id !== confirmDeleteSearch));
+      setConfirmDeleteSearch(null);
+      success("Saved search removed");
+    } catch {
+      // ignore
+    }
+  };
+
+  // ── Tab render map (replaces the previous 14-level ternary chain) ────────
+  const tabContent: Record<string, ReactNode> = {
+    posted: (
+      <PostedJobsTab
+        myJobs={myJobs}
+        onExtendJob={handleExtendJob}
+        onRepost={handleRepost}
+        extendModalJob={extendModalJob}
+        onJobExtended={handleJobExtended}
+        onCloseExtendModal={() => setExtendModalJob(null)}
+      />
+    ),
+    applied: <AppliedJobsTab myApplications={myApplications} />,
+    proposals: (
+      <ProposalComparison
+        myJobs={myJobs}
+        jobApplications={jobApplications}
+        publicKey={publicKey}
+      />
+    ),
+    invitations: (
+      <InvitationsTab
+        myInvitations={myInvitations}
+        onDecline={handleDeclineInvitation}
+      />
+    ),
+    analytics: (
+      <AnalyticsTab
+        myJobs={myJobs}
+        selectedJob={selectedJob}
+        extendingJob={extendingJob}
+        onSelectJob={setSelectedJob}
+        onExtend={(job) => handleExtendJob(job.id)}
+      />
+    ),
+    earnings: <EarningsChart publicKey={publicKey} />,
+    swap: (
+      <SwapEarningsTab
+        publicKey={publicKey}
+        xlmBalance={balance}
+        usdcBalance={usdcBalance}
+        onSwapComplete={refreshBalances}
+      />
+    ),
+    spending: (
+      <ClientSpendingTab
+        analytics={spendingAnalytics}
+        loading={spendingLoading}
+        xlmPriceUsd={xlmPriceUsd}
+      />
+    ),
+    send: <SendPaymentForm fromPublicKey={publicKey} />,
+    templates: (
+      <TemplatesTab
+        templates={templates}
+        templateName={templateName}
+        templateContent={templateContent}
+        editingTemplateId={editingTemplateId}
+        onTemplateNameChange={setTemplateName}
+        onTemplateContentChange={setTemplateContent}
+        onSave={handleSaveTemplate}
+        onEdit={handleEditTemplate}
+        confirmDeleteTemplate={confirmDeleteTemplate}
+        onRequestDelete={setConfirmDeleteTemplate}
+        onCancelDelete={() => setConfirmDeleteTemplate(null)}
+        onConfirmDelete={handleConfirmDeleteTemplate}
+      />
+    ),
+    price_alerts: (
+      <PriceAlertsTab
+        minPrice={minPrice}
+        maxPrice={maxPrice}
+        emailEnabled={emailEnabled}
+        alertEmail={alertEmail}
+        onMinPriceChange={setMinPrice}
+        onMaxPriceChange={setMaxPrice}
+        onEmailEnabledChange={setEmailEnabled}
+        onAlertEmailChange={setAlertEmail}
+        onSave={handleSavePriceAlerts}
+      />
+    ),
+    withdrawals: (
+      <WithdrawalsTab
+        withdrawHistory={withdrawHistory}
+        onWithdraw={() => setShowWithdraw(true)}
+      />
+    ),
+    saved_searches: (
+      <SavedSearchesTab
+        savedSearches={savedSearches}
+        savedSearchesLoading={savedSearchesLoading}
+        onBrowse={() => router.push("/jobs")}
+        onToggleInApp={handleToggleSavedSearch}
+        confirmDeleteSearch={confirmDeleteSearch}
+        onRequestRemove={setConfirmDeleteSearch}
+        onCancelRemove={() => setConfirmDeleteSearch(null)}
+        onConfirmRemove={handleConfirmDeleteSearch}
+      />
+    ),
+    referrals: <ReferralDashboard publicKey={publicKey} />,
+    talent_pool: (
+      <TalentPoolTab
+        entries={talentPool}
+        openJobs={myJobs.filter((j) => j.status === "open")}
+        onRemoved={(id) => setTalentPool((prev) => prev.filter((e) => e.id !== id))}
+        onInvited={() => toast.success("Invitation sent!")}
+      />
+    ),
+  };
+
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 py-10 animate-fade-in">
 
@@ -403,29 +709,7 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
             )}
           </div>
           <div className="flex items-center gap-2">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-            <span className="address-tag">{shortenAddress(publicKey)}</span>
-            <button
-              onClick={handleCopy}
-              className={clsx(
-                "p-1.5 rounded-md transition-all flex items-center justify-center h-7 min-w-[28px]",
-                copied ? "text-emerald-400 bg-emerald-400/10 border border-emerald-400/20" : 
-                copyError ? "text-red-400 bg-red-400/10 border border-red-400/20" : 
-                "text-amber-600 hover:text-amber-300 hover:bg-amber-400/10 border border-transparent"
-              )}
-              title="Copy public key"
-            >
-              {copied ? (
-                <span className="text-xs font-medium px-1">Copied!</span>
-              ) : copyError ? (
-                <span className="text-xs font-medium px-1">Failed</span>
-              ) : (
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-                </svg>
-              )}
-            </button>
+            <WalletAddressDisplay address={publicKey} />
           </div>
           <Link
             href="/post-job"
@@ -577,12 +861,19 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
 
       {/* Tabs */}
       {(() => {
+        const totalProposalCount = (() => {
+          let count = 0;
+          jobApplications.forEach((apps) => { count += apps.length; });
+          return count;
+        })();
         const tabIds: Tab[] = [
           "posted",
           "applied",
+          "proposals",
           "invitations",
           "analytics",
           "earnings",
+          "swap",
           ...(canViewSpending ? (["spending"] as Tab[]) : []),
           "send",
           "edit_profile",
@@ -590,19 +881,23 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
           "price_alerts",
           "withdrawals",
           "saved_searches",
+          "talent_pool",
         ];
         const tabLabel = (t: Tab): string =>
           t === "posted" ? `Jobs Posted (${myJobs.length})` :
           t === "applied" ? `Applications (${myApplications.length})` :
+          t === "proposals" ? `Proposals (${totalProposalCount})` :
           t === "invitations" ? `Invitations${myInvitations.length > 0 ? ` (${myInvitations.length})` : ""}` :
           t === "analytics" ? "Job Analytics" :
           t === "earnings" ? "Earnings" :
+          t === "swap" ? "Swap earnings" :
           t === "spending" ? "Spending" :
           t === "send" ? "Send" :
           t === "templates" ? "Templates" :
           t === "price_alerts" ? "Price Alerts" :
           t === "withdrawals" ? `Withdrawals (${withdrawHistory.length})` :
           t === "saved_searches" ? `Saved Searches${savedSearches.length > 0 ? ` (${savedSearches.length})` : ""}` :
+          t === "talent_pool" ? `Talent Pool${talentPool.length > 0 ? ` (${talentPool.length})` : ""}` :
           "Edit Profile";
 
         return (
@@ -660,315 +955,8 @@ export default function Dashboard({ publicKey, onConnect }: DashboardProps) {
               </div>
             </div>
           </div>
-        ) : tab === "posted" ? (
-          <PostedJobsTab
-            myJobs={myJobs}
-            onExtendJob={handleExtendJob}
-            onRepost={handleRepost}
-            extendModalJob={extendModalJob}
-            onJobExtended={handleJobExtended}
-            onCloseExtendModal={() => setExtendModalJob(null)}
-          />
-        ) : tab === "applied" ? (
-          <AppliedJobsTab myApplications={myApplications} />
-        ) : tab === "analytics" ? (
-          selectedJob ? (
-            <JobAnalytics
-              job={selectedJob}
-              onExtend={() => handleExtendJob(selectedJob.id)}
-            />
-          ) : (
-            <div className="space-y-3">
-              {myJobs.map((job) => (
-                <button
-                  key={job.id}
-                  onClick={() => setSelectedJob(job)}
-                  className="btn-secondary text-sm px-3 py-2 mr-2 mb-2"
-                >
-                  {job.title}
-                  {extendingJob === job.id ? " (Extending...)" : ""}
-                </button>
-              ))}
-            </div>
-          )
-        ) : tab === "earnings" ? (
-          <EarningsChart publicKey={publicKey} />
-        ) : tab === "spending" ? (
-          <ClientSpendingTab
-            analytics={spendingAnalytics}
-            loading={spendingLoading}
-            xlmPriceUsd={xlmPriceUsd}
-          />
-        ) : tab === "send" ? (
-          <SendPaymentForm fromPublicKey={publicKey} />
-        ) : tab === "templates" ? (
-          <div className="space-y-4">
-            <div className="card space-y-3">
-              <input
-                value={templateName}
-                onChange={(e) => setTemplateName(e.target.value)}
-                className="input-field"
-                placeholder="Template name"
-              />
-              <textarea
-                value={templateContent}
-                onChange={(e) => setTemplateContent(e.target.value)}
-                className="textarea-field"
-                rows={5}
-                placeholder="Template proposal content"
-              />
-              <button
-                className="btn-primary text-sm"
-                onClick={async () => {
-                  if (!templateName.trim() || !templateContent.trim()) return;
-                  if (editingTemplateId) {
-                    const updated = await updateProposalTemplate(
-                      editingTemplateId,
-                      { name: templateName, content: templateContent },
-                    );
-                    setTemplates((current) =>
-                      current.map((item) =>
-                        item.id === updated.id ? updated : item,
-                      ),
-                    );
-                    setEditingTemplateId(null);
-                  } else {
-                    const created = await createProposalTemplate({
-                      name: templateName,
-                      content: templateContent,
-                    });
-                    setTemplates((current) => [created, ...current]);
-                  }
-                  setTemplateName("");
-                  setTemplateContent("");
-                }}
-              >
-                {editingTemplateId ? "Update Template" : "Create Template"}
-              </button>
-            </div>
-            {templates.length === 0 ? (
-              <StateMessage
-                type="empty"
-                title="No proposal templates"
-                description="Create a template to speed up your proposals"
-                ctaLabel="Create Template"
-                onCta={() => {
-                  setTemplateName('');
-                  setTemplateContent('');
-                }}
-              />
-            ) : (
-              templates.map((template) => (
-                <div key={template.id} className="card">
-                  <div className="flex items-center justify-between gap-3 mb-2">
-                    <p className="text-amber-100 font-medium">{template.name}</p>
-                    <div className="flex gap-2">
-                      <button
-                        className="btn-secondary text-xs px-3 py-1.5"
-                        onClick={() => {
-                          setEditingTemplateId(template.id);
-                          setTemplateName(template.name);
-                          setTemplateContent(template.content);
-                        }}
-                      >
-                        Edit
-                      </button>
-                      <button
-                        className="btn-secondary text-xs px-3 py-1.5"
-                        onClick={async () => {
-                          await deleteProposalTemplate(template.id);
-                          setTemplates((current) =>
-                            current.filter((item) => item.id !== template.id),
-                          );
-                        }}
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  </div>
-                  <p className="text-sm text-amber-700 whitespace-pre-wrap">
-                    {template.content}
-                  </p>
-                </div>
-              )))}
-          </div>
-        ) : tab === "invitations" ? (
-          <InvitationsTab
-            myInvitations={myInvitations}
-            onDecline={async (id) => {
-              try {
-                await declineInvitation(id);
-                setMyInvitations((prev) => prev.filter((i) => i.id !== id));
-                success("Invitation declined.");
-              } catch {
-                // ignore
-              }
-            }}
-          />
-        ) : tab === "price_alerts" ? (
-          (!minPrice && !maxPrice && !emailEnabled) ? (
-            <StateMessage
-              type="empty"
-              title="No price alerts set"
-              description="Configure alerts to stay informed about XLM price changes"
-              ctaLabel="Add Alert"
-              onCta={() => {
-                // focus could be added later
-              }}
-            />
-          ) : (
-            <div className="card space-y-4 max-w-lg">
-              <input
-                type="number"
-                value={minPrice}
-                onChange={(e) => setMinPrice(e.target.value)}
-                className="input-field"
-                placeholder="Alert if XLM drops below (USD)"
-              />
-              <input
-                type="number"
-                value={maxPrice}
-                onChange={(e) => setMaxPrice(e.target.value)}
-                className="input-field"
-                placeholder="Alert if XLM rises above (USD)"
-              />
-              <label className="flex items-center gap-2 text-sm text-amber-200">
-                <input
-                  type="checkbox"
-                  checked={emailEnabled}
-                  onChange={(e) => setEmailEnabled(e.target.checked)}
-                />
-                Enable email notifications
-              </label>
-              {emailEnabled && (
-                <input
-                  value={alertEmail}
-                  onChange={(e) => setAlertEmail(e.target.value)}
-                  className="input-field"
-                  placeholder="Email address"
-                />
-              )}
-              <button
-                className="btn-primary text-sm"
-                onClick={async () => {
-                  await upsertPriceAlertPreference(publicKey, {
-                    minXlmPriceUsd: minPrice ? Number(minPrice) : null,
-                    maxXlmPriceUsd: maxPrice ? Number(maxPrice) : null,
-                    emailNotificationsEnabled: emailEnabled,
-                    email: alertEmail,
-                  });
-                  success("Price alert settings saved");
-                }}
-              >
-                Save Alerts
-              </button>
-            </div>
-          )
-        ) : tab === "withdrawals" ? (
-          withdrawHistory.length === 0 ? (
-            <StateMessage
-              type="empty"
-              title="No withdrawals yet"
-              description="Add a withdrawal to move funds to your bank account"
-              ctaLabel="Withdraw now"
-              onCta={() => setShowWithdraw(true)}
-            />
-          ) : (
-            <div className="space-y-3">
-              {withdrawHistory.map((entry) => (
-                <div key={entry.id} className="card">
-                  <p className="font-display font-semibold text-amber-100">
-                    {entry.amount} {entry.asset} → {entry.fiatCurrency}
-                  </p>
-                </div>
-              ))}
-            </div>
-          )
-        ) : tab === "saved_searches" ? (
-          savedSearchesLoading ? (
-            <div className="space-y-3">
-              {[1, 2, 3].map((i) => (
-                <div key={i} className="card animate-pulse h-20" />
-              ))}
-            </div>
-          ) : savedSearches.length === 0 ? (
-            <StateMessage
-              type="empty"
-              title="No saved searches"
-              description="Save a search on the Jobs page to get notified when matching jobs are posted"
-              ctaLabel="Browse Jobs"
-              onCta={() => router.push("/jobs")}
-            />
-          ) : (
-            <div className="space-y-3">
-              {savedSearches.map((s) => (
-                <div key={s.id} className="card flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div className="flex-1 min-w-0">
-                    <div className="flex flex-wrap gap-1.5 mb-2">
-                      {Object.entries(s.query_params).map(([key, val]) => (
-                        <span
-                          key={key}
-                          className="text-xs bg-market-500/10 text-market-400 border border-market-500/20 px-2 py-0.5 rounded-md"
-                        >
-                          {key}: {val}
-                        </span>
-                      ))}
-                      {Object.keys(s.query_params).length === 0 && (
-                        <span className="text-xs text-amber-700">All jobs</span>
-                      )}
-                    </div>
-                    <p className="text-xs text-amber-800">
-                      Saved {new Date(s.created_at).toLocaleDateString()} ·
-                      In-app: {s.notify_in_app ? "\u2713" : "\u2715"} ·
-                      Email: {s.notify_email ? "\u2713" : "\u2715"}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2 flex-shrink-0">
-                    <button
-                      onClick={async () => {
-                        try {
-                          const updated = await updateSavedSearch(s.id, {
-                            notify_in_app: !s.notify_in_app,
-                          });
-                          setSavedSearches((prev) =>
-                            prev.map((x) => (x.id === updated.id ? updated : x))
-                          );
-                          success("Notification preference updated");
-                        } catch {
-                          // ignore
-                        }
-                      }}
-                      className={`text-xs px-3 py-2 rounded-lg border min-h-[44px] transition-colors ${
-                        s.notify_in_app
-                          ? "bg-market-500/15 text-market-300 border-market-500/30"
-                          : "bg-ink-800 text-amber-700 border-market-500/10"
-                      }`}
-                    >
-                      In-app
-                    </button>
-                    <button
-                      onClick={async () => {
-                        try {
-                          await deleteSavedSearch(s.id);
-                          setSavedSearches((prev) => prev.filter((x) => x.id !== s.id));
-                          success("Saved search removed");
-                        } catch {
-                          // ignore
-                        }
-                      }}
-                      className="text-xs px-3 py-2 rounded-lg border border-red-500/20 text-red-400 hover:bg-red-500/10 min-h-[44px] transition-colors"
-                    >
-                      Remove
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )
-        ) : tab === "referrals" ? (
-          <ReferralDashboard publicKey={publicKey} />
         ) : (
-          <EditProfileForm publicKey={publicKey} />
+          tabContent[tab] ?? <EditProfileForm publicKey={publicKey} />
         )}
 
         {showBuyXLM && (

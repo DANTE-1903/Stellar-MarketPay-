@@ -10,6 +10,11 @@
 
 const pool = require("../db/pool");
 
+// Issue #1390 — caps on loggable time
+const MAX_ENTRY_MINUTES = 24 * 60;        // a single entry may not exceed 24 h
+const MAX_WEEKLY_MINUTES = 168 * 60;      // one freelancer, one job, any trailing 7 days
+const WEEKLY_WINDOW_DAYS = 7;
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function validatePublicKey(key) {
@@ -28,6 +33,7 @@ function rowToEntry(row) {
     durationMinutes: row.duration_minutes,
     description: row.description,
     startedAt: row.started_at,
+    milestoneIndex: row.milestone_index ?? null,
     createdAt: row.created_at,
   };
 }
@@ -59,10 +65,11 @@ function rowToInvoice(row) {
  * @param {string} params.freelancerAddress Stellar G-address of the freelancer.
  * @param {number} params.durationMinutes  Positive integer minutes worked.
  * @param {string} [params.description]    Optional description of work done.
+ * @param {number} [params.milestoneIndex] Optional 0-based milestone index.
  * @param {string} [params.startedAt]      ISO timestamp when work started (defaults to NOW).
  * @returns {Promise<Object>} The created time entry.
  */
-async function logTimeEntry({ jobId, freelancerAddress, durationMinutes, description, startedAt }) {
+async function logTimeEntry({ jobId, freelancerAddress, durationMinutes, description, milestoneIndex, startedAt }) {
   validatePublicKey(freelancerAddress);
 
   if (!jobId) {
@@ -72,8 +79,22 @@ async function logTimeEntry({ jobId, freelancerAddress, durationMinutes, descrip
   }
 
   const minutes = parseInt(durationMinutes, 10);
-  if (!minutes || minutes <= 0 || minutes > 1440) {
+  if (!minutes || minutes <= 0) {
     const e = new Error("durationMinutes must be a positive integer no greater than 1440 (24 h)");
+    e.status = 400;
+    throw e;
+  }
+  if (minutes > MAX_ENTRY_MINUTES) {
+    const e = new Error(
+      `durationMinutes must not exceed ${MAX_ENTRY_MINUTES} (24 h) for a single time entry; received ${minutes}`
+    );
+    e.status = 422;
+    throw e;
+  }
+
+  const startedAtDate = startedAt ? new Date(startedAt) : null;
+  if (startedAtDate && isNaN(startedAtDate.getTime())) {
+    const e = new Error("startedAt must be a valid ISO 8601 timestamp");
     e.status = 400;
     throw e;
   }
@@ -100,16 +121,48 @@ async function logTimeEntry({ jobId, freelancerAddress, durationMinutes, descrip
     throw e;
   }
 
+  // Validate milestone index if provided
+  const msIdx = milestoneIndex != null ? parseInt(milestoneIndex, 10) : null;
+  if (msIdx != null && (isNaN(msIdx) || msIdx < 0)) {
+    const e = new Error("milestoneIndex must be a non-negative integer");
+    e.status = 400;
+    throw e;
+  }
+
+  // Cap total time per freelancer per job over the trailing 7-day window
+  // ending at this entry's start time (or now, if no start time was given).
+  const windowEnd = (startedAtDate || new Date()).toISOString();
+  const { rows: sumRows } = await pool.query(
+    `SELECT COALESCE(SUM(duration_minutes), 0)::int AS total_minutes
+     FROM time_entries
+     WHERE job_id = $1
+       AND freelancer_address = $2
+       AND COALESCE(started_at, created_at) >  $3::timestamptz - INTERVAL '${WEEKLY_WINDOW_DAYS} days'
+       AND COALESCE(started_at, created_at) <= $3::timestamptz`,
+    [jobId, freelancerAddress, windowEnd]
+  );
+  const loggedMinutes = Number(sumRows[0]?.total_minutes) || 0;
+  if (loggedMinutes + minutes > MAX_WEEKLY_MINUTES) {
+    const remaining = Math.max(0, MAX_WEEKLY_MINUTES - loggedMinutes);
+    const e = new Error(
+      `Logging ${minutes} minutes would exceed the ${MAX_WEEKLY_MINUTES}-minute (168 h) limit per job ` +
+      `in a ${WEEKLY_WINDOW_DAYS}-day window; ${loggedMinutes} minutes already logged, ${remaining} remaining`
+    );
+    e.status = 422;
+    throw e;
+  }
+
   const { rows } = await pool.query(
     `INSERT INTO time_entries
-       (job_id, freelancer_address, duration_minutes, description, started_at, created_at)
-     VALUES ($1, $2, $3, $4, $5, NOW())
+       (job_id, freelancer_address, duration_minutes, description, milestone_index, started_at, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, NOW())
      RETURNING *`,
     [
       jobId,
       freelancerAddress,
       minutes,
       description ? description.trim().slice(0, 500) : null,
+      msIdx,
       startedAt || null,
     ]
   );
