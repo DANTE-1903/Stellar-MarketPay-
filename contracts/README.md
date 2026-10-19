@@ -6,6 +6,47 @@ We use the **Certora Prover** with **Certora Verification Language (CVL)** to fo
 
 ---
 
+## Escrow State Machine
+
+The diagram below shows every `EscrowStatus` state and the contract functions that trigger each transition.
+Each arrow is labelled **`function_name` — *authorized caller***.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Locked : create_escrow / create_escrow_with_deliverable\n/ create_escrow_with_milestones — client
+
+    Locked --> InProgress      : start_work — freelancer
+    Locked --> Released        : release_escrow / release_with_conversion — client
+    Locked --> Refunded        : refund_escrow — client
+    Locked --> Refunded        : timeout_refund — client (after timeout)
+    Locked --> Disputed        : raise_dispute — client or freelancer
+
+    InProgress --> Released    : release_escrow / release_with_conversion — client
+    InProgress --> Released    : release_milestone (all milestones done) — client
+    InProgress --> Disputed    : raise_dispute — client or freelancer
+    InProgress --> Disputed    : submit_deliverable_hash (hash mismatch) — client or freelancer
+
+    Disputed --> Released      : resolve_dispute — arbitrator / admin
+
+    Frozen --> Locked          : unfreeze_contract (M-of-N admins) — admin
+    Frozen --> InProgress      : unfreeze_contract (M-of-N admins) — admin
+    Frozen --> Disputed        : unfreeze_contract (M-of-N admins) — admin
+
+    Locked --> Frozen          : freeze_contract — admin
+    InProgress --> Frozen      : freeze_contract — admin
+    Disputed --> Frozen        : freeze_contract — admin
+
+    Released --> [*]
+    Refunded --> [*]
+```
+
+> **Notes**
+> - `release_milestone` transitions to `Released` only when **all** milestone percentages have been released.
+> - `freeze_contract` / `unfreeze_contract` operate on the **global contract**, not individual escrows. While the contract is frozen, every state-mutating call reverts. The diagram above models the effective per-escrow state visibility during a freeze.
+> - `resolve_dispute` uses a split-percentage: the winner receives their share and the remainder goes back to the other party; the escrow is then marked `Released`.
+
+---
+
 ## Covered Invariants
 
 The formal verification suite validates three critical security invariants for the escrow lifecycle:
@@ -78,7 +119,7 @@ The prover will:
 
 ## CI/CD Integration
 
-We have integrated automated formal verification via GitHub Actions in [.github/workflows/certora.yml](file:///Users/mac/drips/Stellar-MarketPay-/.github/workflows/certora.yml).
+We have integrated automated formal verification via GitHub Actions in [certora.yml](../.github/workflows/certora.yml).
 
 ### Trigger Conditions
 Verification automatically runs on pulls/pushes targeting `main` or `dev` branches when:
@@ -94,7 +135,7 @@ If a rule fails or the prover encounters a verification violation, the build fai
 ## Extending Specifications
 
 To add a new rule:
-1. Open [contracts/certora/escrow.spec](file:///Users/mac/drips/Stellar-MarketPay-/contracts/certora/escrow.spec).
+1. Open [contracts/certora/escrow.spec](certora/escrow.spec).
 2. Declare any new methods/getters under the `methods` block if needed.
 3. Write your rule using CVL syntax. For example, to check that non-positive escrow amounts cannot be created:
    ```cvl

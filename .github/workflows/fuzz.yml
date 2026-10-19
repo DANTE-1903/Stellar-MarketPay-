@@ -1,14 +1,32 @@
-name: Fuzz Contract
+name: Fuzz
 
 on:
-  pull_request:
+  push:
+    branches: [main]
     paths:
-      - "contracts/marketpay-contract/src/**"
-      - "contracts/marketpay-contract/fuzz/**"
+      - "contracts/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "contracts/**"
+  schedule:
+    # Nightly at 02:00 UTC
+    - cron: "0 2 * * *"
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # PR / push: 10 min (600 s) — scheduled nightly: 30 min (1800 s)
+  FUZZ_TIME: ${{ github.event_name == 'schedule' && '1800' || '600' }}
 
 jobs:
   fuzz:
-    name: cargo-fuzz (${{ matrix.target }})
+    name: Fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -17,25 +35,54 @@ jobs:
           - fuzz_create_escrow
           - fuzz_release_escrow
           - fuzz_timeout_refund
+    defaults:
+      run:
+        working-directory: contracts/marketpay-contract/fuzz
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rustfmt
 
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
+      # ── Cargo / build cache ────────────────────────────────────────────────
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-fuzz-${{ hashFiles('contracts/marketpay-contract/fuzz/Cargo.toml') }}
+            ~/.rustup
+            contracts/marketpay-contract/fuzz/target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('contracts/**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-fuzz-
+
+      # ── Fuzz corpus cache (shared between runs for seed reuse) ─────────────
+      - name: Restore fuzz corpus
+        uses: actions/cache@v6
+        with:
+          path: contracts/marketpay-contract/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
-      - name: Run fuzz target for 60 seconds
-        working-directory: contracts/marketpay-contract
+      - name: Fuzz ${{ matrix.target }} (${{ env.FUZZ_TIME }}s)
         run: |
-          cargo fuzz run ${{ matrix.target }} -- -max_total_time=60 -timeout=10
+          mkdir -p ../crashes/${{ matrix.target }}/
+          cargo fuzz run ${{ matrix.target }} \
+            -- \
+            -max_total_time=${{ env.FUZZ_TIME }} \
+            -artifact_prefix=../crashes/${{ matrix.target }}/
+
+      # ── Upload crash artifacts on failure ─────────────────────────────────
+      - name: Upload crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crashes-${{ matrix.target }}-${{ github.run_id }}
+          path: contracts/marketpay-contract/crashes/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30

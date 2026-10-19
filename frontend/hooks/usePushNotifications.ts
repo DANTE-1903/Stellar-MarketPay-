@@ -1,6 +1,7 @@
 /**
  * hooks/usePushNotifications.ts
  * Web Push notification subscription management
+ * Type errors resolved.
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -112,7 +113,7 @@ export function usePushNotifications() {
       if (!subscription) {
         subscription = await registration.pushManager.subscribe({
           userVisibleOnly: true,
-          applicationServerKey: urlBase64ToUint8Array(state.vapidPublicKey!),
+          applicationServerKey: urlBase64ToUint8Array(state.vapidPublicKey!).buffer as ArrayBuffer,
         });
       }
 
@@ -128,7 +129,7 @@ export function usePushNotifications() {
         throw new Error("Failed to save subscription on backend");
       }
 
-      setState((prev) => ({ ...prev, isSubscribed: true });
+      setState((prev) => ({ ...prev, isSubscribed: true }));
       success("Push notifications enabled");
       return true;
     } catch (err) {

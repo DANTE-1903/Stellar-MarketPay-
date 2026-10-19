@@ -1,6 +1,11 @@
+import SubmitDeliverableHash from "@/components/SubmitDeliverableHash";
 import TimeTracker from "@/components/TimeTracker";
 import FeeEstimationModal from "@/components/FeeEstimationModal";
-import { useEffect, useState } from "react";
+import ConfirmDialog from "@/components/ConfirmDialog";
+import ReputationBadge from "@/components/ReputationBadge";
+import ClientReputationCard from "@/components/ClientReputationCard";
+import { useCallback, useEffect, useState } from "react";
+import { useRealtimeBids } from "@/hooks/useRealtimeBids";
 import { useRouter } from "next/router";
 import Link from "next/link";
 import Head from "next/head";
@@ -9,13 +14,17 @@ import ApplicationForm from "@/components/ApplicationForm";
 import WalletConnect from "@/components/WalletConnect";
 import RatingForm from "@/components/RatingForm";
 import ShareJobModal from "@/components/ShareJobModal";
+import { usePriceContext } from "@/contexts/PriceContext";
 import {
   fetchJob,
   fetchApplications,
+  fetchApplicationsPage,
   acceptApplication,
   releaseEscrow,
   raiseDispute,
   inviteFreelancer,
+  mintCompletionCertificate,
+  fetchNftCertificateByJob,
 } from "@/lib/api";
 import {
   formatXLM,
@@ -24,10 +33,12 @@ import {
   shortenAddress,
   statusLabel,
   statusClass,
+  formatUSDEquivalent,
 } from "@/utils/format";
 import {
   accountUrl,
   buildReleaseEscrowTransaction,
+  buildMintCertificateTx,
   submitSignedSorobanTransaction,
   buildPartialReleaseTransaction,
 } from "@/lib/stellar";
@@ -35,6 +46,9 @@ import { signTransactionWithWallet } from "@/lib/wallet";
 import { optionalClientEnv } from "@/lib/env";
 import type { Transaction } from "@stellar/stellar-sdk";
 import type { Application, Job } from "@/utils/types";
+import DisputeWizard from "@/components/DisputeWizard";
+import { useRecentlyViewed } from "@/hooks/useRecentlyViewed";
+import RealtimeBidComparison from "@/components/RealtimeBidComparison";
 
 // ── Site-wide canonical origin used in OG/Twitter meta tags (#487) ─────────
 // RESOLVED_AT_BUILD is the build-time fallback used by client-rendered
@@ -92,7 +106,7 @@ function truncate(text: string, max = 200): string {
  * branches canonicalize to themselves instead of leaking production URLs.
  */
 export const getServerSideProps: GetServerSideProps<
-  JobDetailProps & { ogBaseUrl: string }
+  Pick<JobDetailProps, "ssrJob" | "ogBaseUrl">
 > = async ({ params, req }) => {
   const jobId = typeof params?.id === "string" ? params.id : "";
   const host =
@@ -107,7 +121,7 @@ export const getServerSideProps: GetServerSideProps<
     ? `${proto}://${host}`
     : SITE_URL;
 
-  if (!jobId) return { props: { ssrJob: null, ogBaseUrl } };
+  if (!jobId) return { notFound: true };
 
   try {
     // Forward the request origin so the backend can apply any geo headers.
@@ -120,6 +134,7 @@ export const getServerSideProps: GetServerSideProps<
       // Don't let ISR cache stale job data — jobs change frequently.
       cache: "no-store",
     });
+    if (res.status === 404) return { notFound: true };
     if (!res.ok) return { props: { ssrJob: null, ogBaseUrl } };
     const body = await res.json();
     const data = body?.data;
@@ -127,14 +142,14 @@ export const getServerSideProps: GetServerSideProps<
       return { props: { ssrJob: null, ogBaseUrl } };
     }
     // Whitelist fields we actually need in meta tags to keep payload tiny.
-    const ssrJob = {
+    const ssrJob: JobDetailProps["ssrJob"] = {
       id: String(data.id),
       title: String(data.title || ""),
       description: String(data.description || ""),
       category: String(data.category || ""),
       budget: String(data.budget || ""),
-      currency: String(data.currency || "XLM"),
-      status: String(data.status || "open"),
+      currency: String(data.currency || "XLM") as Job["currency"],
+      status: String(data.status || "open") as Job["status"],
       skills: Array.isArray(data.skills) ? data.skills.map(String) : [],
       clientAddress: String(data.clientAddress || ""),
       createdAt: String(data.createdAt || ""),
@@ -161,24 +176,31 @@ function Spinner() {
 }
 
 export default function JobDetail({ publicKey, onConnect, ssrJob, ogBaseUrl }: JobDetailProps) {
+  const { xlmPriceUsd } = usePriceContext();
   const router = useRouter();
   const jobId = typeof router.query.id === "string" ? router.query.id : null;
 
   const [job, setJob] = useState<Job | null>(null);
   const [applications, setApplications] = useState<Application[]>([]);
+  const [applicationsCursor, setApplicationsCursor] = useState<string | null>(null);
+  const [loadingMoreApplications, setLoadingMoreApplications] = useState(false);
   const [loading, setLoading] = useState(true);
   const [showApplyForm, setShowApplyForm] = useState(false);
-  const [optimisticallyApplied, setOptimisticallyApplied] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
   const [ratingSubmitted, setRatingSubmitted] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [releasingEscrow, setReleasingEscrow] = useState(false);
   const [releaseSuccess, setReleaseSuccess] = useState(false);
+  const [mintingCertificate, setMintingCertificate] = useState(false);
+  const [certificateMinted, setCertificateMinted] = useState(false);
+  const [certificateError, setCertificateError] = useState<string | null>(null);
+  const [showReleaseConfirm, setShowReleaseConfirm] = useState(false);
   const [prefillData, setPrefillData] = useState<any>(null);
   const [showDisputeModal, setShowDisputeModal] = useState(false);
   const [disputeReason, setDisputeReason] = useState("");
   const [disputeDescription, setDisputeDescription] = useState("");
   const [raisingDispute, setRaisingDispute] = useState(false);
+  const [showDisputeWizard, setShowDisputeWizard] = useState(false);
   // Escrow timeout state
   const [timeoutLedger, setTimeoutLedger] = useState<number | null>(null);
   const [currentLedger, setCurrentLedger] = useState(0);
@@ -194,9 +216,30 @@ export default function JobDetail({ publicKey, onConnect, ssrJob, ogBaseUrl }: J
   const [inviting, setInviting] = useState(false);
   const [inviteError, setInviteError] = useState<string | null>(null);
 
+  const { addRecentJob } = useRecentlyViewed();
+
   const isClient = Boolean(publicKey && job?.clientAddress === publicKey);
   const isFreelancer = Boolean(publicKey && job?.freelancerAddress === publicKey);
-  const hasApplied = optimisticallyApplied || applications.some((a) => a.freelancerAddress === publicKey);
+  const hasApplied = applications.some((a) => a.freelancerAddress === publicKey);
+
+  // ── fetchApplications wrapper for useRealtimeBids ────────────────────────
+  const fetchAppsForJob = useCallback(async (): Promise<Application[]> => {
+    if (!jobId) return [];
+    try {
+      return await fetchApplications(jobId);
+    } catch {
+      return [];
+    }
+  }, [jobId]);
+
+  // ── Real-time bids via useRealtimeBids ───────────────────────────────────
+  const {
+    applications: realtimeApplications,
+  } = useRealtimeBids({
+    jobId: jobId ?? "",
+    initialApplications: applications,
+    fetchApplications: fetchAppsForJob,
+  });
 
   useEffect(() => {
     if (!jobId || !router.isReady) return;
@@ -210,28 +253,43 @@ export default function JobDetail({ publicKey, onConnect, ssrJob, ogBaseUrl }: J
       }
     }
 
-    Promise.all([fetchJob(jobId), fetchApplications(jobId)])
-      .then(([loadedJob, loadedApplications]) => {
+    Promise.all([fetchJob(jobId), fetchApplicationsPage(jobId)])
+      .then(([loadedJob, loadedApplicationsPage]) => {
         setJob(loadedJob);
-        setApplications(loadedApplications);
+        setApplications(loadedApplicationsPage.applications);
+        setApplicationsCursor(loadedApplicationsPage.nextCursor);
+        addRecentJob(jobId);
       })
       .catch(() => router.push("/jobs"))
       .finally(() => setLoading(false));
-  }, [jobId, router.isReady, router]);
+  }, [jobId, router.isReady, router, addRecentJob]);
 
   const handleAcceptApplication = async (applicationId: string) => {
     if (!publicKey || !jobId) return;
     try {
       setActionError(null);
       await acceptApplication(applicationId, publicKey);
-      const [updatedJob, updatedApplications] = await Promise.all([
+      const [updatedJob, updatedApplicationsPage] = await Promise.all([
         fetchJob(jobId),
-        fetchApplications(jobId),
+        fetchApplicationsPage(jobId),
       ]);
       setJob(updatedJob);
-      setApplications(updatedApplications);
+      setApplications(updatedApplicationsPage.applications);
+      setApplicationsCursor(updatedApplicationsPage.nextCursor);
     } catch {
       setActionError("Failed to accept application.");
+    }
+  };
+
+  const loadMoreApplications = async () => {
+    if (!jobId || !applicationsCursor || loadingMoreApplications) return;
+    setLoadingMoreApplications(true);
+    try {
+      const nextPage = await fetchApplicationsPage(jobId, undefined, applicationsCursor);
+      setApplications((current) => [...current, ...nextPage.applications]);
+      setApplicationsCursor(nextPage.nextCursor);
+    } finally {
+      setLoadingMoreApplications(false);
     }
   };
 
@@ -260,10 +318,56 @@ export default function JobDetail({ publicKey, onConnect, ssrJob, ogBaseUrl }: J
       const refreshedJob = await fetchJob(job.id);
       setJob(refreshedJob);
       setReleaseSuccess(true);
+
+      // AC: After escrow release, mint a proof-of-work NFT certificate for
+      // the freelancer. The client signs the mint transaction with their
+      // wallet (the contract requires client auth), then the backend records
+      // it so it can be rendered and shared via URL.
+      await handleMintCertificate();
     } catch (error: unknown) {
       setActionError(error instanceof Error ? error.message : "Could not complete escrow release.");
     } finally {
       setReleasingEscrow(false);
+    }
+  };
+
+  /**
+   * Build + sign + submit the on-chain `mint_certificate` Soroban call and
+   * record the certificate in the backend. Safe to call standalone (retry)
+   * or chained after a successful escrow release.
+   */
+  const handleMintCertificate = async () => {
+    if (!publicKey || !job) return;
+    if (!job.escrowContractId) {
+      setCertificateError("This job has no escrow contract ID, so a certificate cannot be minted.");
+      return;
+    }
+
+    setMintingCertificate(true);
+    setCertificateError(null);
+
+    try {
+      const prepared = await buildMintCertificateTx(job.escrowContractId, job.id, job.title, publicKey);
+      const { signedXDR, error: signError } = await signTransactionWithWallet(prepared.toXDR());
+
+      if (signError || !signedXDR) {
+        setCertificateError(signError || "Signing was cancelled.");
+        return;
+      }
+
+      const { hash } = await submitSignedSorobanTransaction(signedXDR);
+      await mintCompletionCertificate({
+        jobId: job.id,
+        clientAddress: publicKey,
+        contractTxHash: hash,
+      });
+      setCertificateMinted(true);
+    } catch (error: unknown) {
+      setCertificateError(
+        error instanceof Error ? error.message : "Could not mint the completion certificate.",
+      );
+    } finally {
+      setMintingCertificate(false);
     }
   };
 
@@ -306,6 +410,24 @@ export default function JobDetail({ publicKey, onConnect, ssrJob, ogBaseUrl }: J
     }
   };
 
+  // On load, if the job is already completed, check whether a certificate was
+  // previously minted so returning visitors see the shareable link instead of
+  // a (client-only) mint button.
+  useEffect(() => {
+    if (!jobId || !job || job.status !== "completed") return;
+    let cancelled = false;
+    fetchNftCertificateByJob(jobId)
+      .then(() => {
+        if (!cancelled) setCertificateMinted(true);
+      })
+      .catch(() => {
+        // No certificate yet (404) or backend unavailable — treat as unminted.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId, job]);
+
   const handleInviteFreelancer = async () => {
     if (!publicKey || !job) return;
     if (!inviteFreelancerAddress || !/^G[A-Z0-9]{55}$/.test(inviteFreelancerAddress)) {
@@ -327,7 +449,10 @@ export default function JobDetail({ publicKey, onConnect, ssrJob, ogBaseUrl }: J
     }
   };
 
-  const handleConfirmTimeoutRefundFee = () => {
+  const handleConfirmTimeoutRefundFee = (_details: { maxFeeMultiplier: number; maxFeeStroops: bigint }) => {
+    console.debug(
+      `[FeeEstimationModal] User confirmed with maxFeeMultiplier=${_details.maxFeeMultiplier}, maxFeeStroops=${_details.maxFeeStroops.toString()}`
+    );
     setPendingTimeoutRefund(null);
   };
 
@@ -518,21 +643,29 @@ export default function JobDetail({ publicKey, onConnect, ssrJob, ogBaseUrl }: J
                 <div className="mt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                   <div className="flex flex-wrap gap-3 text-xs sm:text-sm text-amber-700">
                     <span>Posted {timeAgo(job.createdAt)}</span>
-                    <span>{applications.length} application{applications.length === 1 ? "" : "s"}</span>
+                    <span>{realtimeApplications.length} application{realtimeApplications.length === 1 ? "" : "s"}</span>
                     {job.deadline && <span>Deadline: {formatDate(job.deadline)}</span>}
                   </div>
 
                   <div className="sm:text-right">
                     <p className="text-xs text-amber-800 mb-1">Budget</p>
                     <p className="font-mono font-bold text-xl sm:text-2xl text-market-400">{formatXLM(job.budget)} {job.currency}</p>
-                    <a
-                      href={accountUrl(job.clientAddress)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 mt-2 text-xs sm:text-sm text-amber-700 hover:text-market-400 transition-colors"
-                    >
-                      Client: {shortenAddress(job.clientAddress)} ↗
-                    </a>
+                    {xlmPriceUsd !== null && (
+                      <p className="text-xs text-amber-700 mt-1">
+                        {formatUSDEquivalent(job.budget, xlmPriceUsd)}
+                      </p>
+                    )}
+                    <div className="flex flex-col sm:items-end gap-1.5 mt-2">
+                      <a
+                        href={accountUrl(job.clientAddress)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-xs sm:text-sm text-amber-700 hover:text-market-400 transition-colors"
+                      >
+                        Client: {shortenAddress(job.clientAddress)} ↗
+                      </a>
+                      <ReputationBadge userId={job.clientAddress} size="sm" />
+                    </div>
                   </div>
                 </div>
             </div>
@@ -594,68 +727,40 @@ export default function JobDetail({ publicKey, onConnect, ssrJob, ogBaseUrl }: J
           <TimeTracker jobId={job.id} isFreelancer={isFreelancer} isClient={isClient} />
         )}
 
-        {/* ── Applications list (client only) ── */}
-        {isClient && applications.length > 0 && (
+        {isFreelancer && job.status === "in_progress" && publicKey && (
+          <SubmitDeliverableHash jobId={job.id} freelancerAddress={publicKey} />
+        )}
+
+        {/* ── Applications list (client only, real-time via RealtimeBidComparison) ── */}
+        {isClient && (
           <div className="mb-6">
-            <h2 className="font-display text-xl font-bold text-amber-100 mb-4">
-              Applications ({applications.length})
-            </h2>
-
-            <div className="space-y-4">
-              {applications.map((application) => (
-                <div key={application.id} className="card">
-                  <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 sm:gap-4 mb-3">
-                    <a
-                      href={accountUrl(application.freelancerAddress)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="address-tag hover:border-market-500/40 transition-colors break-all text-xs"
-                    >
-                      {shortenAddress(application.freelancerAddress)} ↗
-                    </a>
-
-                    <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-                      <span className="font-mono text-market-400 font-semibold text-xs sm:text-sm whitespace-nowrap">
-                        {formatXLM(application.bidAmount)}
-                      </span>
-                      <span className={`text-xs px-2.5 py-1 rounded-full border flex-shrink-0 ${badgeClass(application.status)}`}>
-                        {application.status}
-                      </span>
-                    </div>
-                  </div>
-
-                  <p className="text-amber-700/80 text-xs sm:text-sm leading-relaxed mb-4 break-words">
-                    {application.proposal}
-                  </p>
-
-                  {application.status === "pending" && job.status === "open" && (
-                    <button
-                      onClick={() => handleAcceptApplication(application.id)}
-                      className="btn-secondary text-xs sm:text-sm py-2 px-4 min-h-[44px] flex items-center w-full sm:w-auto"
-                    >
-                      Accept Proposal
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
+            <RealtimeBidComparison
+              jobId={job.id}
+              initialApplications={applications}
+              isClient={isClient}
+              clientAddress={publicKey || job.clientAddress}
+              fetchApplications={fetchAppsForJob}
+              onAcceptApplication={handleAcceptApplication}
+            />
+            {applicationsCursor && (
+              <button
+                type="button"
+                onClick={loadMoreApplications}
+                disabled={loadingMoreApplications}
+                className="btn-secondary mt-4 w-full"
+              >
+                {loadingMoreApplications ? "Loading applications..." : "Load more applications"}
+              </button>
+            )}
           </div>
         )}
 
         {/* ── Apply section (non-client, open jobs) ── */}
         {job.status === "open" && !isClient && (
           <>
-            {hasApplied ? (
+            {hasApplied && !showApplyForm ? (
               <div className="card text-center py-8 border-market-500/20 mb-6">
-                <div className="flex items-center justify-center gap-2 mb-1">
-                  {optimisticallyApplied && !applications.some((a) => a.freelancerAddress === publicKey) && (
-                    <svg className="animate-spin h-4 w-4 text-market-400" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                    </svg>
-                  )}
-                  <p className="text-market-400 font-medium">Application submitted</p>
-                </div>
+                <p className="text-market-400 font-medium mb-1">Application submitted</p>
                 <p className="text-amber-800 text-sm">
                   The client will review your proposal shortly.
                 </p>
@@ -665,11 +770,11 @@ export default function JobDetail({ publicKey, onConnect, ssrJob, ogBaseUrl }: J
                 job={job}
                 publicKey={publicKey}
                 prefillData={prefillData}
-                onOptimisticSubmit={() => setOptimisticallyApplied(true)}
-                onRevert={() => setOptimisticallyApplied(false)}
                 onSuccess={() => {
-                  setShowApplyForm(false);
-                  fetchApplications(job.id).then(setApplications);
+                  fetchApplicationsPage(job.id).then((page) => {
+                    setApplications(page.applications);
+                    setApplicationsCursor(page.nextCursor);
+                  });
                 }}
               />
             ) : (
@@ -724,12 +829,26 @@ export default function JobDetail({ publicKey, onConnect, ssrJob, ogBaseUrl }: J
             </h2>
 
             <button
-              onClick={handleReleaseEscrow}
+              onClick={() => setShowReleaseConfirm(true)}
               disabled={releasingEscrow}
               className="btn-primary w-full sm:w-auto"
             >
               {releasingEscrow ? "Releasing..." : "Release Escrow"}
             </button>
+
+            <ConfirmDialog
+              open={showReleaseConfirm}
+              title="Release Escrow"
+              description="This will release all escrowed funds to the freelancer. This is an irreversible on-chain action."
+              confirmLabel="Yes, Release Escrow"
+              variant="danger"
+              requireTypedConfirm
+              typedConfirmText="CONFIRM"
+              actionDetails={`Job: ${job?.title || ""} · Amount: ${job?.budget || ""} ${job?.currency || ""}`}
+              onConfirm={handleReleaseEscrow}
+              onCancel={() => setShowReleaseConfirm(false)}
+              loading={releasingEscrow}
+            />
 
             {releaseSuccess && (
               <p className="mt-3 text-emerald-400 text-sm">Escrow released successfully.</p>
@@ -739,6 +858,60 @@ export default function JobDetail({ publicKey, onConnect, ssrJob, ogBaseUrl }: J
 
         {actionError && (
           <p className="mt-3 mb-6 text-red-400 text-sm">{actionError}</p>
+        )}
+
+        {/* ── Proof-of-work certificate (after completion) ── */}
+        {job.status === "completed" && publicKey && (
+          <div className="card mb-6">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <span className="text-3xl" aria-hidden="true">🏅</span>
+                <div>
+                  <h2 className="font-display text-lg sm:text-xl font-bold text-amber-100">
+                    Proof-of-Work Certificate
+                  </h2>
+                  <p className="text-xs text-amber-800 mt-0.5">
+                    Minted as an on-chain Soroban NFT to the freelancer when the escrow was released.
+                  </p>
+                </div>
+              </div>
+
+              {certificateMinted ? (
+                <Link
+                  href={`/certificates/job/${job.id}`}
+                  className="btn-primary text-sm whitespace-nowrap text-center"
+                >
+                  View Certificate ↗
+                </Link>
+              ) : isClient ? (
+                <button
+                  onClick={handleMintCertificate}
+                  disabled={mintingCertificate}
+                  className="btn-primary text-sm whitespace-nowrap"
+                >
+                  {mintingCertificate ? "Minting certificate…" : "Mint Certificate"}
+                </button>
+              ) : (
+                <p className="text-xs text-amber-800 text-right">
+                  The client mints the certificate when they release the escrow.
+                </p>
+              )}
+            </div>
+
+            {mintingCertificate && (
+              <p className="mt-3 text-market-400 text-sm flex items-center gap-2">
+                <Spinner /> Sign the mint transaction in your wallet to award the certificate…
+              </p>
+            )}
+            {certificateError && (
+              <p className="mt-3 text-red-400 text-sm">{certificateError}</p>
+            )}
+            {certificateMinted && (
+              <p className="mt-3 text-emerald-400 text-sm">
+                Certificate minted successfully — share it with anyone via its public URL.
+              </p>
+            )}
+          </div>
         )}
 
         {/* ── Rating form (after completion) ── */}
@@ -782,15 +955,34 @@ export default function JobDetail({ publicKey, onConnect, ssrJob, ogBaseUrl }: J
       {/* ── Dispute modal ── */}
       {showDisputeModal && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-ink-950/80 backdrop-blur-sm" onClick={() => setShowDisputeModal(false)} />
+          <button
+            type="button"
+            aria-label="Close dispute dialog"
+            className="absolute inset-0 w-full bg-ink-950/80 backdrop-blur-sm cursor-default"
+            onClick={() => setShowDisputeModal(false)}
+          />
           <div className="relative w-full max-w-md bg-ink-900 border border-market-500/20 rounded-2xl p-4 sm:p-6 shadow-2xl animate-scale-in max-h-[90vh] overflow-y-auto">
             <h3 className="font-display text-lg sm:text-xl font-bold text-amber-100 mb-2">Raise a Dispute</h3>
-            <p className="text-xs sm:text-sm text-amber-800 mb-6">Flag this job for admin review. This will block escrow release until resolved.</p>
+            <p className="text-xs sm:text-sm text-amber-800 mb-4">Flag this job for admin review. This will block escrow release until resolved.</p>
+
+            <div className="mb-4 p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="text-lg">🤖</span>
+                <span className="text-xs text-amber-200">First time filing a dispute?</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowDisputeWizard(true)}
+                className="text-xs font-semibold text-market-400 hover:text-market-300 underline"
+              >
+                Launch Dispute Assistant →
+              </button>
+            </div>
 
             <div className="space-y-4">
               <div>
-                <label className="label">Reason</label>
-                <select
+                <label htmlFor="reason" className="label">Reason</label>
+                <select id="reason"
                   value={disputeReason}
                   onChange={(e) => setDisputeReason(e.target.value)}
                   className="input-field"
@@ -804,8 +996,8 @@ export default function JobDetail({ publicKey, onConnect, ssrJob, ogBaseUrl }: J
                 </select>
               </div>
               <div>
-                <label className="label">Description</label>
-                <textarea
+                <label htmlFor="description" className="label">Description</label>
+                <textarea id="description"
                   value={disputeDescription}
                   onChange={(e) => setDisputeDescription(e.target.value)}
                   className="input-field min-h-[100px]"
@@ -839,18 +1031,44 @@ export default function JobDetail({ publicKey, onConnect, ssrJob, ogBaseUrl }: J
         </div>
       )}
 
+      {/* ── Dispute Wizard Chatbot (Issue #1557) ── */}
+      {showDisputeWizard && job && (
+        <DisputeWizard
+          jobId={job.id}
+          isOpen={showDisputeWizard}
+          initialReason={disputeReason}
+          initialDescription={disputeDescription}
+          onClose={() => setShowDisputeWizard(false)}
+          onPrefillForm={({ reason, description }) => {
+            setDisputeReason(reason);
+            setDisputeDescription(description);
+            setShowDisputeWizard(false);
+          }}
+          onComplete={() => {
+            setShowDisputeWizard(false);
+            setShowDisputeModal(false);
+            fetchJob();
+          }}
+        />
+      )}
+
       {/* ── Invite Freelancer modal ── */}
       {showInviteModal && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-ink-950/80 backdrop-blur-sm" onClick={() => setShowInviteModal(false)} />
+          <button
+            type="button"
+            aria-label="Close invite dialog"
+            className="absolute inset-0 w-full bg-ink-950/80 backdrop-blur-sm cursor-default"
+            onClick={() => setShowInviteModal(false)}
+          />
           <div className="relative w-full max-w-md bg-ink-900 border border-market-500/20 rounded-2xl p-4 sm:p-6 shadow-2xl animate-scale-in">
             <h3 className="font-display text-lg sm:text-xl font-bold text-amber-100 mb-2">Invite Freelancer</h3>
-            <p className="text-xs sm:text-sm text-amber-800 mb-6">Enter the freelancer's Stellar public key to invite them to this job.</p>
+            <p className="text-xs sm:text-sm text-amber-800 mb-6">Enter the freelancer&apos;s Stellar public key to invite them to this job.</p>
 
             <div className="space-y-4">
               <div>
-                <label className="label">Freelancer Public Key</label>
-                <input
+                <label htmlFor="freelancer-public-key" className="label">Freelancer Public Key</label>
+                <input id="freelancer-public-key"
                   type="text"
                   value={inviteFreelancerAddress}
                   onChange={(e) => setInviteFreelancerAddress(e.target.value)}

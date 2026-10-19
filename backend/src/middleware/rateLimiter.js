@@ -3,6 +3,9 @@
 const rateLimit = require("express-rate-limit");
 const pool = require("../db/pool");
 const { getClientIp } = require("../utils/clientIp");
+const { createServiceLogger } = require("../utils/logger");
+
+const rateLimitLogger = createServiceLogger("rate-limiter");
 
 const MAX_OPEN_DISPUTES = 3;
 const MAX_DISPUTES_30_DAYS = 10;
@@ -39,19 +42,32 @@ function scaleMaxRequests(maxRequests) {
 /**
  * Factory function to create reusable rate limiters
  */
-const createRateLimiter = (maxRequests, windowMinutes) => {
+const createRateLimiter = (maxRequests, windowMinutes, options = {}) => {
   return rateLimit({
     windowMs: windowMinutes * 60 * 1000,
     max: scaleMaxRequests(maxRequests),
     standardHeaders: true,
     legacyHeaders: true,
-    keyGenerator: (req) => getClientIp(req),
+    keyGenerator: (req) => req.ip,
     handler: (req, res) => {
-      res.set("Retry-After", Math.ceil(windowMinutes * 60));
+      const retryAfter = Math.ceil(windowMinutes * 60);
+      res.set("Retry-After", String(retryAfter));
+      rateLimitLogger.warn({
+        endpoint: options.name || req.originalUrl,
+        ip: getClientIp(req),
+        method: req.method,
+        path: req.path,
+        userId: req.user?.publicKey,
+        retryAfter,
+        requestId: req.requestId,
+      }, "Rate limit exceeded");
+      res.setHeader("Cache-Control", "no-store");
       return res.status(429).json({
+        error: "Too many requests — please wait before trying again",
         message: "Too many requests — please wait before trying again",
       });
     },
+    ...options,
   });
 };
 
@@ -92,17 +108,19 @@ async function createDisputeRateLimiter(req, res, next) {
 
     if (openCount >= MAX_OPEN_DISPUTES) {
       res.set("Retry-After", "3600");
+      res.setHeader("Cache-Control", "no-store");
       return res.status(429).json({
-        success: false,
         error: `You already have ${openCount} open ${openCount === 1 ? "dispute" : "disputes"}. Maximum is ${MAX_OPEN_DISPUTES}. Resolve existing disputes before opening new ones.`,
+        code: "RATE_LIMITED",
       });
     }
 
     if (recentCount >= MAX_DISPUTES_30_DAYS) {
       res.set("Retry-After", "86400");
+      res.setHeader("Cache-Control", "no-store");
       return res.status(429).json({
-        success: false,
         error: `You have opened ${recentCount} ${recentCount === 1 ? "dispute" : "disputes"} in the last 30 days. Maximum is ${MAX_DISPUTES_30_DAYS}. Please wait before opening more.`,
+        code: "RATE_LIMITED",
       });
     }
 
@@ -113,4 +131,44 @@ async function createDisputeRateLimiter(req, res, next) {
   }
 }
 
-module.exports = { createRateLimiter, createDisputeRateLimiter, getRateLimitScale, scaleMaxRequests };
+
+const crypto = require("crypto");
+
+function hashRateLimitIdentifier(prefix, value) {
+  if (!value) return `${prefix}:anonymous`;
+  const hash = crypto.createHash("sha256").update(String(value)).digest("hex").slice(0, 16);
+  return `${prefix}:${hash}`;
+}
+
+function createSensitiveRateLimiters({
+  namespace = "sensitive",
+  windowMinutes = 60,
+  maxRequestsPerIp = 10,
+  maxRequestsPerPrincipal = 10,
+  principalKeyGenerator = (req) => req.body?.publicKey || req.params?.publicKey,
+} = {}) {
+  const ipLimiter = createRateLimiter(maxRequestsPerIp, windowMinutes, {
+    keyGenerator: (req) => `${namespace}:ip:${getClientIp(req)}`,
+    requestPropertyName: `rateLimit_${namespace}_ip`,
+  });
+
+  const principalLimiter = createRateLimiter(maxRequestsPerPrincipal, windowMinutes, {
+    keyGenerator: (req) => {
+      const principal = principalKeyGenerator(req);
+      return hashRateLimitIdentifier(`${namespace}:principal`, principal || getClientIp(req));
+    },
+    requestPropertyName: `rateLimit_${namespace}_principal`,
+  });
+
+  return [ipLimiter, principalLimiter];
+}
+
+module.exports = {
+  createRateLimiter,
+  createDisputeRateLimiter,
+  createSensitiveRateLimiters,
+  hashRateLimitIdentifier,
+  getRateLimitScale,
+  scaleMaxRequests,
+  rateLimitLogger,
+};

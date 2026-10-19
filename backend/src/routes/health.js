@@ -1,74 +1,101 @@
 /**
  * src/routes/health.js
  *
- * Enhanced health check endpoint for readiness probes (Kubernetes / Docker).
+ * Health check endpoint for readiness probes (Docker / Kubernetes).
  *
  * GET /health
- *   - Runs SELECT 1 against the database (timeout: 2 s)
- *   - Pings Stellar Horizon /ledgers?limit=1 (timeout: 2 s)
+ *   - Checks PostgreSQL (SELECT 1, 2 s timeout)
+ *   - Checks Redis (PING, 2 s timeout)
+ *   - Checks Stellar Horizon (/ledgers?limit=1, 2 s timeout)
  *   - Returns 200 when all dependencies are healthy
- *   - Returns 503 when any critical dependency is down
+ *   - Returns 503 when any dependency is down
  *
- * GET /health/db
- *   - Returns pool stats: total, idle, waiting connections
- *
- * Response shape:
+ * Response shape on the degraded path (probe failures):
  *   {
- *     "status": "healthy" | "degraded",
- *     "database": { "status": "ok", "latency_ms": 12 }
- *                | { "status": "error", "message": "..." },
- *     "stellar":  { "status": "ok", "network": "testnet", "ledger": 12345678 }
- *                | { "status": "error", "message": "..." },
- *     "uptime_seconds": 3600,
- *     "version": "1.0.0"
+ *     "status": "degraded",
+ *     "checks": {
+ *       "db": "error",
+ *       "redis": "ok" | "error",
+" *       "stellar": "ok" | "error"
+ *     },
+ *     "contractVersion": "1.2.0" | null
  *   }
+ *
+ * Full body (healthy):
+ *   {
+ *     "status": "healthy",
+ *     "checks": { "db": "ok", "redis": "ok", "stellar": "ok" },
+ *     "uptime_seconds": 3600,
+ *     "version": "1.0.0",
+ *     "contractVersion": "1.2.0",
+ *     "migrationVersion": 21
+ *   }
+ *
+ * `contractVersion` is the escrow contract's on-chain `get_version()` value,
+ * or null when it cannot be read. It does not affect the health status.
  */
 "use strict";
 
 const express = require("express");
 const pool = require("../db/pool");
 const { getPoolStats } = require("../db/pool");
+const cacheService = require("../services/cacheService");
+const { getServer: getSorobanServer } = require("../services/sorobanClient");
+const { getContractVersion } = require("../services/contractVersionService");
 const { createRateLimiter } = require("../middleware/rateLimiter");
-const ipfsService = require("../services/ipfsService");
 
 const router = express.Router();
-// Generous limit — probes hit this frequently
 const healthRateLimiter = createRateLimiter(120, 1);
 
-const SERVER_START = Date.now();
-const VERSION = process.env.npm_package_version || "1.0.0";
 const CHECK_TIMEOUT_MS = 2000;
 
+// Process start time and build version, reported by GET /api/health.
+const SERVER_START = Date.now();
+const VERSION = require("../../package.json").version;
+
 /**
- * Run a SELECT 1 against the pool with a hard timeout.
- * @returns {{ status: "ok", latency_ms: number } | { status: "error", message: string }}
+ * Run SELECT 1 against PostgreSQL with a hard timeout.
+ * @returns {Promise<'up'|'down'>}
  */
-async function checkDatabase() {
-  const start = Date.now();
+async function checkPostgres() {
   try {
     await Promise.race([
       pool.query("SELECT 1"),
       new Promise((_, reject) =>
-        setTimeout(
-          () => reject(new Error("Database check timed out")),
-          CHECK_TIMEOUT_MS,
-        ),
+        setTimeout(() => reject(new Error("Postgres check timed out")), CHECK_TIMEOUT_MS),
       ),
     ]);
-    return { status: "ok", latency_ms: Date.now() - start };
-  } catch (err) {
-    return { status: "error", message: err.message };
+    return "up";
+  } catch {
+    return "down";
+  }
+}
+
+/**
+ * Ping Redis with a hard timeout.
+ * @returns {Promise<'up'|'down'>}
+ */
+async function checkRedis() {
+  try {
+    const result = await Promise.race([
+      cacheService.ping(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Redis check timed out")), CHECK_TIMEOUT_MS),
+      ),
+    ]);
+    return result; // already "up" or "down" from cacheService.ping()
+  } catch {
+    return "down";
   }
 }
 
 /**
  * Ping Stellar Horizon /ledgers?limit=1 with a hard timeout.
- * @returns {{ status: "ok", network: string, ledger: number } | { status: "error", message: string }}
+ * @returns {Promise<'up'|'down'>}
  */
-async function checkStellar() {
+async function checkHorizon() {
   const horizonUrl =
     process.env.HORIZON_URL || "https://horizon-testnet.stellar.org";
-  const network = process.env.STELLAR_NETWORK || "testnet";
 
   try {
     const controller = new AbortController();
@@ -84,41 +111,42 @@ async function checkStellar() {
       clearTimeout(timer);
     }
 
-    if (!res.ok) {
-      return {
-        status: "error",
-        message: `Horizon returned HTTP ${res.status}`,
-      };
-    }
+    if (!res.ok) return "down";
 
     const data = await res.json();
     const ledger = data?._embedded?.records?.[0]?.sequence ?? null;
-    return { status: "ok", network, ledger };
-  } catch (err) {
-    const message =
-      err.name === "AbortError"
-        ? "Stellar Horizon check timed out"
-        : err.message;
-    return { status: "error", message };
+    return ledger != null ? "up" : "down";
+  } catch {
+    return "down";
   }
 }
 
 /**
- * Check IPFS/Pinata configuration status.
- * @returns {{ status: "ok" | "not_configured" }}
+ * Verify that the configured Soroban RPC endpoint is reachable.
+ * @returns {Promise<'up'|'down'>}
  */
-function checkIpfs() {
-  return { status: ipfsService.isConfigured() ? "ok" : "not_configured" };
+async function checkSoroban() {
+  try {
+    const result = await Promise.race([
+      getSorobanServer().getLatestLedger(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Soroban check timed out")), CHECK_TIMEOUT_MS),
+      ),
+    ]);
+    return result?.sequence != null ? "up" : "down";
+  } catch {
+    return "down";
+  }
 }
 
 /**
  * @swagger
- * /health:
+ * /api/health:
  *   get:
- *     summary: Enhanced health check
+ *     summary: Health check
  *     description: >
- *       Checks database connectivity (SELECT 1) and Stellar Horizon reachability.
- *       Returns 200 when healthy, 503 when any critical dependency is down.
+ *       Checks PostgreSQL, Redis, and Stellar Horizon connectivity.
+ *       Returns 200 when all deps are healthy, 503 when any is down.
  *     tags: [Health]
  *     responses:
  *       200:
@@ -131,11 +159,18 @@ function checkIpfs() {
  *                 status:
  *                   type: string
  *                   example: healthy
- *                 database:
+ *                 checks:
  *                   type: object
  *                   properties:
- *                     status: { type: string, example: ok }
- *                     latency_ms: { type: number, example: 12 }
+ *                     db:
+ *                       type: string
+ *                       example: ok
+ *                     redis:
+ *                       type: string
+ *                       example: ok
+ *                     stellar:
+ *                       type: string
+ *                       example: ok
  *                 stellar:
  *                   type: object
  *                   properties:
@@ -144,51 +179,68 @@ function checkIpfs() {
  *                     ledger: { type: number, example: 12345678 }
  *                 uptime_seconds: { type: number, example: 3600 }
  *                 version: { type: string, example: "1.0.0" }
+ *                 contractVersion:
+ *                   type: string
+ *                   nullable: true
+ *                   example: "1.2.0"
+ *                   description: Semver of the deployed escrow contract (get_version()), null if unreadable
+ *                 migrationVersion:
+ *                   type: integer
+ *                   nullable: true
+ *                   example: 21
+ *                   description: Current schema_migrations version from the database
  *       503:
- *         description: One or more dependencies are down
+ *         description: >
+ *           One or more dependencies are down. When the database is
+ *           unreachable, timed out, or throws, the body is a flattened
+ *           degradation payload: { status: "degraded", checks: { db: "error", redis: "ok", stellar: "ok" }, contractVersion }
+ *           otherwise the full degraded body is returned.
  */
 router.get("/", healthRateLimiter, async (req, res) => {
-  const [database, stellar] = await Promise.all([
-    checkDatabase(),
-    checkStellar(),
+  const [postgres, redis, horizon, soroban, contractVersion] = await Promise.all([
+    checkPostgres(),
+    checkRedis(),
+    checkHorizon(),
+    checkSoroban(),
+    getContractVersion().catch(() => null),
   ]);
-  const ipfs = checkIpfs();
 
-  const healthy = database.status === "ok" && stellar.status === "ok";
+  const allUp =
+    postgres === "up" &&
+    redis === "up" &&
+    horizon === "up" &&
+    soroban === "up";
 
   const body = {
-    status: healthy ? "healthy" : "degraded",
-    database,
-    stellar,
-    ipfs,
+    status: allUp ? "healthy" : "degraded",
+    database: postgres,
+    redis,
+    stellar: horizon,
+    soroban,
     uptime_seconds: Math.floor((Date.now() - SERVER_START) / 1000),
     version: VERSION,
+    contractVersion,
     indexer: req.app.locals.indexerService
       ? req.app.locals.indexerService.getHealth()
       : null,
+    migrationVersion: req.app.locals.migrationVersion ?? null,
   };
 
-  // Fire-and-forget: persist check results (failure is non-fatal)
-  const now = new Date().toISOString();
-  [
-    { service: "database", status: database.status },
-    { service: "stellar",  status: stellar.status },
-    { service: "ipfs",     status: ipfs.status },
-  ].forEach(({ service, status }) => {
-    pool
-      .query(
-        `INSERT INTO health_checks (service, status, checked_at) VALUES ($1, $2, $3)`,
-        [service, status, now],
-      )
-      .catch((err) =>
-        console.warn("[health] health_checks insert failed:", err.message),
-      );
-  });
-
-  res.status(healthy ? 200 : 503).json(body);
+  res.status(allUp ? 200 : 503).json(body);
 });
 
-// GET /health/db — pool connection stats for monitoring
+// GET /api/health/db — pool connection stats for monitoring
+/**
+ * @swagger
+ * /api/health/db:
+ *   get:
+ *     summary: Database pool stats
+ *     description: Pool connection statistics for monitoring dashboards.
+ *     tags: [Health]
+ *     responses:
+ *       200:
+ *         description: Pool statistics
+ */
 router.get("/db", healthRateLimiter, async (req, res) => {
   const stats = getPoolStats();
   res.json({
