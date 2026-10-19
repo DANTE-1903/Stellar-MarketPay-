@@ -14,6 +14,8 @@
     "test": "jest --ci",
     "test:update-snapshots": "jest -u",
     "test:e2e": "playwright test",
+    "test:a11y": "playwright test tests/e2e/accessibility.spec.ts",
+    "audit:contrast": "node scripts/audit-contrast.mjs",
     "analyze": "ANALYZE=true next build",
     "storybook": "storybook dev -p 6006",
     "storybook:build": "storybook build -o storybook-static"

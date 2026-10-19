@@ -24,6 +24,7 @@ Welcome to Stellar MarketPay documentation. This index helps you find what you n
 - **[Authentication Flow (SEP-10)](./auth-flow.md)** - Complete SEP-10 auth flow with sequence diagrams
 - **[Soroban Contract Deployment](./contract-deployment.md)** - Build, deploy, and configure the escrow contract
 - **[Smart Contract API Reference](./contract-api-reference.md)** - Complete function reference for the MarketPay Soroban contract
+- **[Accessibility Guide](./accessibility.md)** - WCAG 2.1 AA compliance, testing tools, and accessible components
 - **[Environment Variables](./environment-variables.md)** - Single source of truth for runtime config
 
 ### API Documentation
@@ -245,6 +246,7 @@ Decisions that shaped Stellar MarketPay's architecture:
 stellar-marketpay/
 ├── docs/
 │   ├── INDEX.md (this file)
+│   ├── accessibility.md
 │   ├── ADR-001-soroban-escrow-design.md
 │   ├── ADR-002-horizon-api-indexing.md
 │   ├── ADR-003-database-schema-escrow.md
@@ -321,6 +323,7 @@ stellar-marketpay/
 
 **Frontend & UI**
 
+- [Accessibility Guide](./accessibility.md)
 - [Transaction History](./FAQ.md#how-do-i-view-my-transaction-history)
 - [Pinata IPFS Setup](./PINATA_IPFS_SETUP.md)
 - [Architecture Overview](./architecture.md)
